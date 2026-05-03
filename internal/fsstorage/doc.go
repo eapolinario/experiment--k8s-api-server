@@ -4,6 +4,6 @@
 // Layout: <root>/<resource-plural>/<namespace>/<name>.json
 // Cluster-scoped resources omit the <namespace> path segment.
 //
-// TODO(fsstorage): implement Create, Get, GetList, Delete, GuaranteedUpdate,
-// Watch, Count. Maintain a monotonic resourceVersion in <root>/.rv.
+// A monotonic uint64 resourceVersion is persisted to <root>/.rv and
+// stamped into each written object.
 package fsstorage
