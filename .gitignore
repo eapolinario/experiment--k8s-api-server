@@ -1,0 +1,19 @@
+# Build outputs
+/bin/
+/result
+/result-*
+
+# Runtime state (the "etcd" + pki + pids + logs + kubeconfig)
+/data/
+/run/
+
+# Per-shell GOPATH used by the nix dev shell
+/.gopath/
+
+# direnv
+/.direnv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
