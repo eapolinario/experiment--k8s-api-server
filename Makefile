@@ -94,6 +94,10 @@ tidy: ## go mod tidy
 test: ## Run unit tests
 	$(GO) test ./...
 
+.PHONY: smoke
+smoke: ## Full end-to-end smoke test (requires Docker)
+	@bash scripts/smoke.sh
+
 .PHONY: lint
 lint: ## Run golangci-lint
 	golangci-lint run ./...
