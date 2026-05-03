@@ -30,6 +30,9 @@
             # --- Kubernetes client ---
             kubectl
 
+            # --- GitHub CLI ---
+            gh
+
             # --- Container runtime ---
             # NOTE: only the Docker CLI is provided here. The Docker *daemon*
             # must be running on the host (systemd, Docker Desktop, colima,
