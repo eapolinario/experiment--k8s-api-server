@@ -61,7 +61,11 @@ case "${1:-}" in
       --data-dir="$DATA_DIR" \
       --kubeconfig-out="$KUBECONFIG_PATH"
     start_one kubelet-lite "$KUBELET_PID" "$KUBELET_LOG" \
-      "$KUBELET_BIN"
+      "$KUBELET_BIN" \
+      --kubeconfig="$KUBECONFIG_PATH" \
+      --resync=30s \
+      --node-name=kubelet-lite \
+      -v=2
     echo "use \`make logs\` to follow output, \`make down\` to stop"
     ;;
   down)
