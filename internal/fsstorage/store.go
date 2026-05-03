@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -29,6 +28,11 @@ type Config struct {
 	Newer func() runtime.Object
 	// NewerList constructs an empty list pointer (e.g. &corev1.PodList{}).
 	NewerList func() runtime.Object
+	// Counter, if non-nil, is the shared resourceVersion counter. When
+	// multiple Store instances share the same Root, callers MUST pass in
+	// a single Counter so RVs remain globally monotonic. If nil, a
+	// per-instance Counter is created — fine when there's only one Store.
+	Counter *Counter
 }
 
 // New constructs a new filesystem-backed storage.Interface.
@@ -45,16 +49,19 @@ func New(cfg Config) (storage.Interface, error) {
 	if err := os.MkdirAll(cfg.Root, 0o755); err != nil {
 		return nil, fmt.Errorf("fsstorage: create root: %w", err)
 	}
+	if cfg.Counter == nil {
+		c, err := NewCounter(cfg.Root)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Counter = c
+	}
 	s := &store{
 		cfg:       cfg,
 		versioner: storage.APIObjectVersioner{},
 		broadcast: newBroadcaster(1000),
+		counter:   cfg.Counter,
 	}
-	rv, err := s.loadRV()
-	if err != nil {
-		return nil, err
-	}
-	s.rv = rv
 	return s, nil
 }
 
@@ -62,88 +69,27 @@ type store struct {
 	cfg       Config
 	versioner storage.APIObjectVersioner
 	broadcast *broadcaster
-
-	rvMu sync.Mutex
-	rv   uint64
+	counter   *Counter
 
 	keyMuMap sync.Map // map[string]*sync.Mutex
 }
 
 func (s *store) Versioner() storage.Versioner { return s.versioner }
 
-func (s *store) ReadinessCheck() error                            { return nil }
-func (s *store) RequestWatchProgress(ctx context.Context) error   { return nil }
-func (s *store) CompactRevision() int64                           { return 0 }
+func (s *store) ReadinessCheck() error                          { return nil }
+func (s *store) RequestWatchProgress(ctx context.Context) error { return nil }
+func (s *store) CompactRevision() int64                         { return 0 }
 func (s *store) EnableResourceSizeEstimation(storage.KeysFunc) error {
 	return nil
 }
 
 // --- RV management ---
 
-func (s *store) rvFile() string { return filepath.Join(s.cfg.Root, ".rv") }
+// nextRV bumps the shared counter (and persists it).
+func (s *store) nextRV() (uint64, error) { return s.counter.Next() }
 
-func (s *store) loadRV() (uint64, error) {
-	b, err := os.ReadFile(s.rvFile())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 1, nil
-		}
-		return 0, err
-	}
-	str := strings.TrimSpace(string(b))
-	if str == "" {
-		return 1, nil
-	}
-	v, err := strconv.ParseUint(str, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("fsstorage: parse .rv: %w", err)
-	}
-	if v < 1 {
-		v = 1
-	}
-	return v, nil
-}
-
-func (s *store) persistRV(rv uint64) error {
-	tmp := s.rvFile() + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(strconv.FormatUint(rv, 10)); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, s.rvFile())
-}
-
-// nextRV bumps and persists the global RV counter.
-func (s *store) nextRV() (uint64, error) {
-	s.rvMu.Lock()
-	defer s.rvMu.Unlock()
-	s.rv++
-	if err := s.persistRV(s.rv); err != nil {
-		s.rv--
-		return 0, err
-	}
-	return s.rv, nil
-}
-
-func (s *store) currentRV() uint64 {
-	s.rvMu.Lock()
-	defer s.rvMu.Unlock()
-	return s.rv
-}
+// currentRV returns the latest issued RV without bumping.
+func (s *store) currentRV() uint64 { return s.counter.Current() }
 
 func (s *store) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
 	return s.currentRV(), nil
@@ -679,7 +625,7 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 	// Subscribe BEFORE listing, so we don't miss events. We hold the broadcast
 	// lock while determining the start point.
 	s.broadcast.mu.Lock()
-	currentRV := s.rv
+	currentRV := s.counter.Current()
 
 	// Initial state delivery.
 	if startRV == 0 {

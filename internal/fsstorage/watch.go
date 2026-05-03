@@ -84,13 +84,13 @@ func (b *broadcaster) subscribeLocked(w *watcher) {
 // --- watcher ---
 
 type watcher struct {
-	ctx       context.Context
-	predicate storage.SelectionPredicate
+	ctx        context.Context
+	predicate  storage.SelectionPredicate
 	matchesKey func(runtime.Object) bool
-	ch        chan watch.Event
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	onStop    func()
+	ch         chan watch.Event
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	onStop     func()
 }
 
 func newWatcher(ctx context.Context, p storage.SelectionPredicate, matchesKey func(runtime.Object) bool, buf int) *watcher {

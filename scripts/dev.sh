@@ -15,6 +15,9 @@ DATA_DIR="$ROOT_DIR/data"
 APISERVER_BIN="$BIN_DIR/apiserver"
 KUBELET_BIN="$BIN_DIR/kubelet-lite"
 
+PKI_DIR="$RUN_DIR/pki"
+KUBECONFIG_PATH="$RUN_DIR/kubeconfig"
+
 APISERVER_PID="$RUN_DIR/apiserver.pid"
 KUBELET_PID="$RUN_DIR/kubelet-lite.pid"
 
@@ -22,13 +25,13 @@ APISERVER_LOG="$RUN_DIR/apiserver.log"
 KUBELET_LOG="$RUN_DIR/kubelet-lite.log"
 
 start_one() {
-  local name="$1" bin="$2" pid_file="$3" log_file="$4"
+  local name="$1" pid_file="$2" log_file="$3"; shift 3
   if [[ -f "$pid_file" ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
     echo "$name already running (pid $(<"$pid_file"))"
     return 0
   fi
   echo "starting $name → $log_file"
-  ( "$bin" >"$log_file" 2>&1 & echo $! >"$pid_file" )
+  ( "$@" >"$log_file" 2>&1 & echo $! >"$pid_file" )
 }
 
 stop_one() {
@@ -46,11 +49,19 @@ stop_one() {
 
 case "${1:-}" in
   up)
-    mkdir -p "$RUN_DIR" "$DATA_DIR"
-    # TODO(harness): generate self-signed PKI + kubeconfig in $RUN_DIR if missing.
-    # Will be filled in once the apiserver phase produces a working binary.
-    start_one apiserver     "$APISERVER_BIN" "$APISERVER_PID" "$APISERVER_LOG"
-    start_one kubelet-lite  "$KUBELET_BIN"   "$KUBELET_PID"   "$KUBELET_LOG"
+    mkdir -p "$RUN_DIR" "$DATA_DIR" "$PKI_DIR"
+    # The apiserver binary is responsible for creating the self-signed PKI
+    # and kubeconfig on first run; we just pass explicit paths so the
+    # Makefile-side tooling and the binary agree.
+    start_one apiserver "$APISERVER_PID" "$APISERVER_LOG" \
+      "$APISERVER_BIN" \
+      --bind-address=127.0.0.1 \
+      --secure-port=6443 \
+      --cert-dir="$PKI_DIR" \
+      --data-dir="$DATA_DIR" \
+      --kubeconfig-out="$KUBECONFIG_PATH"
+    start_one kubelet-lite "$KUBELET_PID" "$KUBELET_LOG" \
+      "$KUBELET_BIN"
     echo "use \`make logs\` to follow output, \`make down\` to stop"
     ;;
   down)

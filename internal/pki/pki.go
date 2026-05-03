@@ -16,9 +16,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	clientcmdlatest "k8s.io/client-go/tools/clientcmd/api/latest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -63,12 +63,12 @@ func EnsureServerCert(dir string, hosts []string, validity time.Duration) error 
 	}
 	now := time.Now().Add(-1 * time.Minute)
 	caTmpl := &x509.Certificate{
-		SerialNumber: serial(),
-		Subject:      pkix.Name{CommonName: "experiment-k8s-apiserver-ca"},
-		NotBefore:    now,
-		NotAfter:     now.Add(validity),
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
-		IsCA:         true,
+		SerialNumber:          serial(),
+		Subject:               pkix.Name{CommonName: "experiment-k8s-apiserver-ca"},
+		NotBefore:             now,
+		NotAfter:              now.Add(validity),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 	}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
