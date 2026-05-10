@@ -226,3 +226,38 @@ func TestEventLastSeen_FallsBackThroughTimestamps(t *testing.T) {
 		t.Errorf("EventTime fallback failed, got %v", got)
 	}
 }
+
+func TestConfigMapTable_Row(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+		Data:       map[string]string{"a": "1", "b": "2"},
+		BinaryData: map[string][]byte{"c": {0x01}},
+	}
+	tbl, err := configMapTableConvertor{}.ConvertToTable(context.Background(), cm, nil)
+	if err != nil {
+		t.Fatalf("ConvertToTable: %v", err)
+	}
+	if tbl.Rows[0].Cells[1] != 3 {
+		t.Errorf("data count=%v want 3 (data+binaryData)", tbl.Rows[0].Cells[1])
+	}
+	if !strings.HasSuffix(tbl.Rows[0].Cells[2].(string), "h") {
+		t.Errorf("age=%v want hour suffix", tbl.Rows[0].Cells[2])
+	}
+}
+
+func TestSecretTable_DefaultsTypeOpaque(t *testing.T) {
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec", CreationTimestamp: metav1.NewTime(time.Now())},
+		Data:       map[string][]byte{"k": []byte("v")},
+	}
+	tbl, err := secretTableConvertor{}.ConvertToTable(context.Background(), s, nil)
+	if err != nil {
+		t.Fatalf("ConvertToTable: %v", err)
+	}
+	if tbl.Rows[0].Cells[1] != "Opaque" {
+		t.Errorf("type=%v want Opaque", tbl.Rows[0].Cells[1])
+	}
+	if tbl.Rows[0].Cells[2] != 1 {
+		t.Errorf("data=%v want 1", tbl.Rows[0].Cells[2])
+	}
+}

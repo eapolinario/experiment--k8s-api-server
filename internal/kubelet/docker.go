@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	cerrdefs "github.com/containerd/errdefs"
@@ -143,6 +144,14 @@ func (r *dockerRT) CreateAndStart(ctx context.Context, name string, spec Contain
 	}
 	host := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
+	}
+	for _, m := range spec.Mounts {
+		host.Mounts = append(host.Mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   m.Source,
+			Target:   m.Target,
+			ReadOnly: m.ReadOnly,
+		})
 	}
 	resp, err := r.cli.ContainerCreate(ctx, cfg, host, nil, nil, name)
 	if err != nil {

@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -47,18 +49,30 @@ func main() {
 		resync     = flag.Duration("resync", 30*time.Second, "informer resync period")
 		nodeName   = flag.String("node-name", "kubelet-lite", "advisory node name (informational; we own every Pod)")
 		logAddr    = flag.String("log-addr", "127.0.0.1:10350", "host:port for the /containerLogs HTTP server")
+		volumeRoot = flag.String("volume-root", "./run/volumes", "host directory for projected ConfigMap/Secret volume contents (bind-mounted into containers)")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
 
-	if err := run(*kubeconfig, *resync, *nodeName, *logAddr); err != nil {
+	if err := run(*kubeconfig, *resync, *nodeName, *logAddr, *volumeRoot); err != nil {
 		klog.Errorf("kubelet-lite: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(kubeconfig string, resync time.Duration, nodeName, logAddr string) error {
-	klog.Infof("kubelet-lite starting (node-name=%s, resync=%s, kubeconfig=%s, log-addr=%s)", nodeName, resync, kubeconfig, logAddr)
+func run(kubeconfig string, resync time.Duration, nodeName, logAddr, volumeRoot string) error {
+	klog.Infof("kubelet-lite starting (node-name=%s, resync=%s, kubeconfig=%s, log-addr=%s, volume-root=%s)", nodeName, resync, kubeconfig, logAddr, volumeRoot)
+
+	if volumeRoot != "" {
+		abs, err := filepath.Abs(volumeRoot)
+		if err != nil {
+			return fmt.Errorf("resolve volume-root: %w", err)
+		}
+		volumeRoot = abs
+		if err := os.MkdirAll(volumeRoot, 0o755); err != nil {
+			return fmt.Errorf("create volume-root %q: %w", volumeRoot, err)
+		}
+	}
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -77,7 +91,7 @@ func run(kubeconfig string, resync time.Duration, nodeName, logAddr string) erro
 	}
 	defer docker.Close()
 
-	r := kubelet.New(clientset, docker, resync)
+	r := kubelet.New(clientset, docker, resync, volumeRoot)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

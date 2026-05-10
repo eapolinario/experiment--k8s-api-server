@@ -1,10 +1,12 @@
 package kubelet
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
 
@@ -55,24 +57,44 @@ type ContainerSpec struct {
 	WorkingDir  string
 	Labels      map[string]string
 	PullPolicy  corev1.PullPolicy
-	ContainerNm string // single Pod container name (informational)
+	ContainerNm string      // single Pod container name (informational)
+	Mounts      []HostMount // bind mounts for projected ConfigMap/Secret volumes
 }
 
 // ContainerSpecFromPod translates a Pod into a ContainerSpec. It assumes the
 // Pod has exactly one container; callers must check this before invoking.
-func ContainerSpecFromPod(pod *corev1.Pod) (ContainerSpec, error) {
+//
+// kube + volumeRoot are used to resolve env / envFrom against ConfigMap /
+// Secret objects in the apiserver and to materialise volume projections
+// onto the host filesystem. Pass nil kube + empty volumeRoot for legacy
+// callers / tests that don't exercise projection (env.valueFrom and
+// volumes will be skipped with a warning in that case).
+func ContainerSpecFromPod(ctx context.Context, kube kubernetes.Interface, pod *corev1.Pod, volumeRoot string) (ContainerSpec, error) {
 	if len(pod.Spec.Containers) != 1 {
 		return ContainerSpec{}, fmt.Errorf("kubelet-lite v1 supports exactly one container per Pod (got %d)", len(pod.Spec.Containers))
 	}
 	c := pod.Spec.Containers[0]
 
-	env := make([]string, 0, len(c.Env))
-	for _, e := range c.Env {
-		if e.ValueFrom != nil {
-			klog.Warningf("pod %s/%s container %q: env %q uses valueFrom, which is unsupported in v1; skipping", pod.Namespace, pod.Name, c.Name, e.Name)
-			continue
+	var env []string
+	var mounts []HostMount
+	if kube != nil {
+		var err error
+		if env, err = resolveEnv(ctx, kube, pod.Namespace, &c); err != nil {
+			return ContainerSpec{}, err
 		}
-		env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
+		if mounts, err = projectVolumes(ctx, kube, pod, &c, volumeRoot); err != nil {
+			return ContainerSpec{}, err
+		}
+	} else {
+		// Legacy / test path: literal env values only, no projection.
+		env = make([]string, 0, len(c.Env))
+		for _, e := range c.Env {
+			if e.ValueFrom != nil {
+				klog.Warningf("pod %s/%s container %q: env %q uses valueFrom but no kube client provided; skipping", pod.Namespace, pod.Name, c.Name, e.Name)
+				continue
+			}
+			env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
+		}
 	}
 
 	var cmd, entrypoint []string
@@ -92,6 +114,7 @@ func ContainerSpecFromPod(pod *corev1.Pod) (ContainerSpec, error) {
 		Labels:      PodLabelsFor(pod),
 		PullPolicy:  ResolvePullPolicy(c.ImagePullPolicy, c.Image),
 		ContainerNm: c.Name,
+		Mounts:      mounts,
 	}, nil
 }
 

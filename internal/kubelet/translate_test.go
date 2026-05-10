@@ -1,6 +1,7 @@
 package kubelet
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestContainerSpecFromPod_Basic(t *testing.T) {
 		},
 	}})
 
-	spec, err := ContainerSpecFromPod(pod)
+	spec, err := ContainerSpecFromPod(context.Background(), nil, pod, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -68,12 +69,12 @@ func TestContainerSpecFromPod_RejectsMultiContainer(t *testing.T) {
 		{Name: "a", Image: "alpine"},
 		{Name: "b", Image: "alpine"},
 	})
-	if _, err := ContainerSpecFromPod(pod); err == nil {
+	if _, err := ContainerSpecFromPod(context.Background(), nil, pod, ""); err == nil {
 		t.Fatal("expected error for multi-container pod")
 	}
 
 	empty := mkPod("empty", nil)
-	if _, err := ContainerSpecFromPod(empty); err == nil {
+	if _, err := ContainerSpecFromPod(context.Background(), nil, empty, ""); err == nil {
 		t.Fatal("expected error for zero-container pod")
 	}
 }

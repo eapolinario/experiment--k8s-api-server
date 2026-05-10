@@ -241,6 +241,54 @@ fi
 # Best-effort namespace cleanup.
 "${KCTL[@]}" delete namespace demo >/dev/null 2>&1 || true
 
+# ----- ConfigMap + Secret projection -----
+echo "smoke: applying ConfigMap + Secret + cfg-consumer pod"
+"${KCTL[@]}" apply --validate=false -f examples/configmap-secret.yaml >/dev/null
+for want in configmap/demo-cfg secret/demo-secret; do
+  if ! "${KCTL[@]}" get "$want" -n default >/dev/null 2>&1; then
+    echo "smoke: FAIL $want not present"
+    fail=1
+  fi
+done
+echo "smoke: kubectl get cm,secret"
+"${KCTL[@]}" get cm,secret -n default 2>&1 | head -10
+
+echo "smoke: waiting for cfg-consumer to reach Running"
+for i in {1..60}; do
+  phase="$("${KCTL[@]}" get pod cfg-consumer -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [[ "$phase" == "Running" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$phase" != "Running" ]]; then
+  echo "smoke: FAIL cfg-consumer never reached Running (phase=$phase)"
+  "${KCTL[@]}" describe pod cfg-consumer -n default | tail -30
+  fail=1
+else
+  echo "smoke: cfg-consumer is Running"
+  # Allow the entrypoint a beat to flush its echo lines.
+  sleep 2
+  logs="$("${KCTL[@]}" logs cfg-consumer -n default 2>&1 || true)"
+  echo "--- cfg-consumer logs ---"
+  echo "$logs"
+  echo "-------------------------"
+  if ! grep -q 'ENV=hello-world TOKEN=s3cret' <<<"$logs"; then
+    echo "smoke: FAIL env projection (envFrom configmap + secret valueFrom) not visible in logs"
+    fail=1
+  fi
+  if ! grep -q 'mode=test' <<<"$logs"; then
+    echo "smoke: FAIL configMap volume projection (file /etc/cfg/app.conf) not visible in logs"
+    fail=1
+  fi
+  if [[ $fail -eq 0 ]]; then
+    echo "smoke: ConfigMap + Secret projection (env + envFrom + volume) verified"
+  fi
+fi
+"${KCTL[@]}" delete pod cfg-consumer -n default --wait=false >/dev/null 2>&1 || true
+"${KCTL[@]}" delete configmap demo-cfg -n default >/dev/null 2>&1 || true
+"${KCTL[@]}" delete secret demo-secret -n default >/dev/null 2>&1 || true
+
 if [[ "$fail" -ne 0 ]]; then
   echo "--- apiserver log tail ---"; tail -50 "$API_LOG"
   echo "--- kubelet log tail ---";   tail -80 "$KUBELET_LOG"

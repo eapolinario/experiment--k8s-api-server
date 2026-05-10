@@ -114,6 +114,83 @@ func (namespaceTableConvertor) ConvertToTable(_ context.Context, object runtime.
 	return t, nil
 }
 
+// configMapTableConvertor renders configmaps as NAME / DATA / AGE — matching `kubectl get cm`.
+type configMapTableConvertor struct{}
+
+var _ rest.TableConvertor = configMapTableConvertor{}
+
+var configMapColumns = []metav1.TableColumnDefinition{
+	{Name: "Name", Type: "string", Format: "name"},
+	{Name: "Data", Type: "integer", Description: "Total number of keys (data + binaryData)"},
+	{Name: "Age", Type: "string", Description: "Time since creation"},
+}
+
+func (configMapTableConvertor) ConvertToTable(_ context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	t := &metav1.Table{}
+	if !tableNoHeaders(tableOptions) {
+		t.ColumnDefinitions = configMapColumns
+	}
+	add := func(c *corev1.ConfigMap) {
+		t.Rows = append(t.Rows, metav1.TableRow{
+			Cells:  []interface{}{c.Name, len(c.Data) + len(c.BinaryData), translateTimestampSince(c.CreationTimestamp)},
+			Object: runtime.RawExtension{Object: c},
+		})
+	}
+	switch o := object.(type) {
+	case *corev1.ConfigMap:
+		add(o)
+	case *corev1.ConfigMapList:
+		t.ResourceVersion = o.ResourceVersion
+		for i := range o.Items {
+			add(&o.Items[i])
+		}
+	default:
+		return nil, fmt.Errorf("configMapTableConvertor: unexpected type %T", object)
+	}
+	return t, nil
+}
+
+// secretTableConvertor renders secrets as NAME / TYPE / DATA / AGE — matching `kubectl get secret`.
+type secretTableConvertor struct{}
+
+var _ rest.TableConvertor = secretTableConvertor{}
+
+var secretColumns = []metav1.TableColumnDefinition{
+	{Name: "Name", Type: "string", Format: "name"},
+	{Name: "Type", Type: "string", Description: "Secret type (Opaque, kubernetes.io/dockerconfigjson, ...)"},
+	{Name: "Data", Type: "integer", Description: "Number of stored keys"},
+	{Name: "Age", Type: "string", Description: "Time since creation"},
+}
+
+func (secretTableConvertor) ConvertToTable(_ context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	t := &metav1.Table{}
+	if !tableNoHeaders(tableOptions) {
+		t.ColumnDefinitions = secretColumns
+	}
+	add := func(s *corev1.Secret) {
+		tp := string(s.Type)
+		if tp == "" {
+			tp = string(corev1.SecretTypeOpaque)
+		}
+		t.Rows = append(t.Rows, metav1.TableRow{
+			Cells:  []interface{}{s.Name, tp, len(s.Data) + len(s.StringData), translateTimestampSince(s.CreationTimestamp)},
+			Object: runtime.RawExtension{Object: s},
+		})
+	}
+	switch o := object.(type) {
+	case *corev1.Secret:
+		add(o)
+	case *corev1.SecretList:
+		t.ResourceVersion = o.ResourceVersion
+		for i := range o.Items {
+			add(&o.Items[i])
+		}
+	default:
+		return nil, fmt.Errorf("secretTableConvertor: unexpected type %T", object)
+	}
+	return t, nil
+}
+
 // eventTableConvertor renders events as LAST SEEN / TYPE / REASON / OBJECT / MESSAGE,
 // matching `kubectl get events`.
 type eventTableConvertor struct{}
