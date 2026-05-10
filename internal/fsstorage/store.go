@@ -579,6 +579,22 @@ func (s *store) Stats(ctx context.Context) (storage.Stats, error) {
 	return storage.Stats{ObjectCount: count, EstimatedAverageObjectSizeBytes: avg}, nil
 }
 
+// newInitialEndBookmark constructs an empty object of the watched kind
+// stamped with the current resourceVersion + the InitialEventsAnnotationKey
+// annotation, suitable for emission as a Bookmark watch.Event after the
+// initial-list snapshot. This is what WatchListClient consumes to detect
+// "snapshot complete".
+func (s *store) newInitialEndBookmark(rv uint64) (runtime.Object, error) {
+	obj := s.cfg.Newer()
+	if err := s.versioner.UpdateObject(obj, rv); err != nil {
+		return nil, err
+	}
+	if err := storage.AnnotateInitialEventsEndBookmark(obj); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
 func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
 	var startRV uint64
 	if opts.ResourceVersion != "" {
@@ -628,6 +644,7 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 	currentRV := s.counter.Current()
 
 	// Initial state delivery.
+	initialEnd := opts.SendInitialEvents != nil && *opts.SendInitialEvents
 	if startRV == 0 {
 		// Snapshot current state.
 		var snap []runtime.Object
@@ -649,6 +666,14 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 		}
 		for _, o := range snap {
 			w.deliver(watch.Event{Type: watch.Added, Object: o})
+		}
+		// initial-events-end bookmark, required by client-go's WatchListClient
+		// (and harmless for legacy clients) so the streaming-list path
+		// terminates without hanging.
+		if initialEnd {
+			if obj, err := s.newInitialEndBookmark(currentRV); err == nil {
+				w.deliver(watch.Event{Type: watch.Bookmark, Object: obj})
+			}
 		}
 	} else if startRV < currentRV {
 		// Need to replay from buffer.

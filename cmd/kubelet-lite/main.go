@@ -17,15 +17,15 @@ import (
 )
 
 // staticGates returns client-go feature gate values matching the v1.35
-// defaults except that WatchListClient is forced off. Our apiserver does
-// not emit a Bookmark on initial list, which the streaming list path
-// requires; the regular LIST+WATCH path works fine.
+// defaults. WatchListClient is left enabled because our fsstorage now
+// emits the initial-events-end Bookmark required by the streaming-list
+// path.
 type staticGates struct{}
 
 func (staticGates) Enabled(f clientfeatures.Feature) bool {
 	switch f {
 	case clientfeatures.WatchListClient:
-		return false
+		return true
 	case clientfeatures.ClientsAllowCBOR, clientfeatures.ClientsPreferCBOR:
 		return false
 	case clientfeatures.InOrderInformers,

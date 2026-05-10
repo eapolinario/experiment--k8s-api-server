@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -495,4 +496,70 @@ func toAPIError(obj runtime.Object) error {
 		return &apierrors.StatusError{ErrStatus: *s}
 	}
 	return fmt.Errorf("not a Status: %T", obj)
+}
+
+func TestWatchInitialEventsBookmark(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newTestStore(t, t.TempDir())
+	for i := 0; i < 2; i++ {
+		p := newPod("default", fmt.Sprintf("b%d", i))
+		if err := s.Create(ctx, keyFor("default", p.Name), p, &corev1.Pod{}, 0); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	send := true
+	w, err := s.Watch(ctx, "/pods/default", storage.ListOptions{
+		ResourceVersion:   "0",
+		Recursive:         true,
+		Predicate:         everything(),
+		SendInitialEvents: &send,
+	})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+	events := drainEvents(w, 200*time.Millisecond)
+	if len(events) != 3 {
+		t.Fatalf("expected 2 Added + 1 Bookmark, got %d events: %+v", len(events), events)
+	}
+	if events[0].Type != watch.Added || events[1].Type != watch.Added {
+		t.Fatalf("first two events should be Added, got %v %v", events[0].Type, events[1].Type)
+	}
+	bm := events[2]
+	if bm.Type != watch.Bookmark {
+		t.Fatalf("third event should be Bookmark, got %v", bm.Type)
+	}
+	acc, err := meta.Accessor(bm.Object)
+	if err != nil {
+		t.Fatalf("accessor: %v", err)
+	}
+	if got := acc.GetAnnotations()["k8s.io/initial-events-end"]; got != "true" {
+		t.Errorf("missing initial-events-end annotation; got annotations=%v", acc.GetAnnotations())
+	}
+	if acc.GetResourceVersion() == "" || acc.GetResourceVersion() == "0" {
+		t.Errorf("bookmark RV=%q expected non-zero", acc.GetResourceVersion())
+	}
+}
+
+func TestWatchNoBookmarkWhenNotRequested(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newTestStore(t, t.TempDir())
+	if err := s.Create(ctx, keyFor("default", "x"), newPod("default", "x"), &corev1.Pod{}, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	w, err := s.Watch(ctx, "/pods/default", storage.ListOptions{
+		ResourceVersion: "0", Recursive: true, Predicate: everything(),
+	})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Stop()
+	events := drainEvents(w, 200*time.Millisecond)
+	for _, ev := range events {
+		if ev.Type == watch.Bookmark {
+			t.Fatalf("unexpected bookmark when SendInitialEvents not set")
+		}
+	}
 }
