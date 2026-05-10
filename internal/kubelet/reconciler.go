@@ -190,6 +190,14 @@ func (r *Reconciler) reconcilePod(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 
+	// Graceful termination: apiserver has set deletionTimestamp but the
+	// object still exists in storage. Stop the container honoring the
+	// grace period, then issue the final force-delete so the apiserver
+	// removes the object and a watch DELETE fires.
+	if pod.DeletionTimestamp != nil {
+		return r.terminatePod(ctx, pod)
+	}
+
 	// One-container restriction.
 	if len(pod.Spec.Containers) != 1 {
 		msg := fmt.Sprintf("kubelet-lite v1 supports exactly one container per Pod (got %d)", len(pod.Spec.Containers))
@@ -224,6 +232,33 @@ func (r *Reconciler) reconcilePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	return r.patchStatus(ctx, pod, PodStatusFromView(pod, view))
+}
+
+// terminatePod stops the pod's container honoring deletionGracePeriodSeconds
+// and then issues a force-delete via the apiserver to finalize. Idempotent:
+// safe to call repeatedly while termination is in flight.
+func (r *Reconciler) terminatePod(ctx context.Context, pod *corev1.Pod) error {
+	name := ContainerNameForUID(string(pod.UID))
+	grace := 30 * time.Second
+	if pod.DeletionGracePeriodSeconds != nil {
+		grace = time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
+	}
+	klog.Infof("pod %s/%s terminating (grace=%s); stopping container %s", pod.Namespace, pod.Name, grace, name)
+	if _, exists, err := r.docker.Inspect(ctx, name); err != nil {
+		return fmt.Errorf("inspect during terminate: %w", err)
+	} else if exists {
+		if err := r.docker.Stop(ctx, name, grace); err != nil {
+			klog.Warningf("stop %s during terminate: %v", name, err)
+		}
+	}
+	// Final force-delete: GracePeriodSeconds=0 takes the immediate-delete
+	// path in the apiserver's BeforeDelete and removes the object.
+	zero := int64(0)
+	err := r.kube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func (r *Reconciler) markFailedOnce(ctx context.Context, pod *corev1.Pod, msg string) error {

@@ -157,3 +157,25 @@ func TestPodTableConvertor_RejectsWrongType(t *testing.T) {
 		t.Errorf("expected type error")
 	}
 }
+
+func TestPodTableConvertor_TerminatingPod(t *testing.T) {
+	now := metav1.Now()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", DeletionTimestamp: &now},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Ready: true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}},
+		},
+	}
+	tbl, err := podTableConvertor{}.ConvertToTable(context.Background(), pod, nil)
+	if err != nil {
+		t.Fatalf("ConvertToTable: %v", err)
+	}
+	if tbl.Rows[0].Cells[2] != "Terminating" {
+		t.Errorf("status cell=%v want Terminating", tbl.Rows[0].Cells[2])
+	}
+}

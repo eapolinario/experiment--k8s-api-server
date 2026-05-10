@@ -6,6 +6,7 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -91,6 +92,50 @@ func (s *objectStrategy) AllowUnconditionalUpdate() bool { return true }
 var _ rest.RESTCreateStrategy = &objectStrategy{}
 var _ rest.RESTUpdateStrategy = &objectStrategy{}
 var _ rest.RESTDeleteStrategy = &objectStrategy{}
+
+// podGracefulStrategy implements rest.RESTGracefulDeleteStrategy on top of
+// objectStrategy so DELETE on a Pod follows the two-phase pattern real
+// Kubernetes uses:
+//
+//  1. First DELETE: apiserver sets metadata.deletionTimestamp and
+//     metadata.deletionGracePeriodSeconds, returns 200, but does NOT remove
+//     the object from storage. A Modified watch event fires.
+//  2. Kubelet observes the update, stops the container honoring the grace
+//     period, then issues a second DELETE with gracePeriodSeconds=0. The
+//     apiserver removes the object from storage; a Deleted watch event
+//     fires; orphan reapers / informers see the deletion.
+//
+// Default grace = spec.terminationGracePeriodSeconds, falling back to 30s
+// (matching upstream behaviour).
+type podGracefulStrategy struct{ *objectStrategy }
+
+func newPodGracefulStrategy(typer runtime.ObjectTyper) *podGracefulStrategy {
+	return &podGracefulStrategy{objectStrategy: newPodStrategy(typer)}
+}
+
+func (podGracefulStrategy) CheckGracefulDelete(_ context.Context, obj runtime.Object, options *metav1.DeleteOptions) bool {
+	if options == nil {
+		return false
+	}
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return false
+	}
+	period := defaultGracePeriodSeconds
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		period = *pod.Spec.TerminationGracePeriodSeconds
+	}
+	if options.GracePeriodSeconds == nil {
+		options.GracePeriodSeconds = &period
+	}
+	// gracePeriodSeconds==0 means "force / immediate". Tell the Store no
+	// graceful path so it removes the object now.
+	return *options.GracePeriodSeconds > 0
+}
+
+const defaultGracePeriodSeconds int64 = 30
+
+var _ rest.RESTGracefulDeleteStrategy = podGracefulStrategy{}
 
 // podStatusStrategy only allows mutation of .status on update.
 type podStatusStrategy struct {
