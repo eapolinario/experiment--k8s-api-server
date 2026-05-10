@@ -166,11 +166,11 @@ between "real Kubernetes" and "the smallest thing that still says
   never accumulate them in the first place.
 - **Leases & TTL.** Used by Endpoints/Lease objects; we don't implement
   Lease and have no TTL machinery.
-- **Watch bookmarks.** Real apiserver emits periodic `Bookmark` events so
-  watch clients can keep `resourceVersion` fresh during quiet periods.
-  We don't, and we explicitly disable the `WatchListClient` feature gate
-  in `kubelet-lite` because client-go 1.35 hangs waiting for the bookmark
-  that ends a streaming-list otherwise.
+- **Watch bookmarks.** We emit the *initial-events-end* `Bookmark` after
+  the snapshot phase of a watch (so client-go's `WatchListClient`
+  streaming-list path terminates), but we don't emit the periodic
+  progress-notify Bookmarks real etcd-backed apiservers send during
+  quiet periods.
 - **Strategic merge / apply.** We accept JSON merge patches (good enough
   for our `/status` updates) and rely on `kubectl apply --validate=false`
   rather than serving a full OpenAPI schema for client-side three-way
