@@ -10,9 +10,10 @@
 //   sinceSeconds=<int>
 //   timestamps=true|false
 //   limitBytes=<int>
+//   container=<name>      (required for multi-container pods; defaults
+//                          to spec.containers[0].name when omitted)
 //
-// We ignore `container` (only one container per Pod in v1) and `previous`
-// (we never restart containers).
+// We ignore `previous` (we never restart containers).
 package kubelet
 
 import (
@@ -31,24 +32,29 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// PodResolver returns the Pod UID for a given namespace+name. Production
-// uses a SharedInformer-backed lister; tests use an in-memory map.
+// PodResolver returns the (UID, ordered container names) for a given
+// namespace+name. Production uses a SharedInformer-backed lister; tests
+// use an in-memory map.
 type PodResolver interface {
-	UIDFor(namespace, name string) (uid string, err error)
+	Resolve(namespace, name string) (uid string, containerNames []string, err error)
 }
 
 // listerResolver adapts a corelisters.PodLister to PodResolver.
 type listerResolver struct{ l corelisters.PodLister }
 
-func (r listerResolver) UIDFor(ns, name string) (string, error) {
+func (r listerResolver) Resolve(ns, name string) (string, []string, error) {
 	p, err := r.l.Pods(ns).Get(name)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if p.UID == "" {
-		return "", fmt.Errorf("pod %s/%s has no UID", ns, name)
+		return "", nil, fmt.Errorf("pod %s/%s has no UID", ns, name)
 	}
-	return string(p.UID), nil
+	names := make([]string, 0, len(p.Spec.Containers))
+	for _, c := range p.Spec.Containers {
+		names = append(names, c.Name)
+	}
+	return string(p.UID), names, nil
 }
 
 // LogServer is an HTTP server exposing `docker logs` for kubelet-lite
@@ -123,7 +129,7 @@ func (s *LogServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	ns, name := parts[0], parts[1]
 
-	uid, err := s.resolver.UIDFor(ns, name)
+	uid, containerNames, err := s.resolver.Resolve(ns, name)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			http.Error(w, fmt.Sprintf("pod %s/%s not found", ns, name), http.StatusNotFound)
@@ -139,7 +145,13 @@ func (s *LogServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rc, err := s.docker.Logs(r.Context(), ContainerNameForUID(uid), opts)
+	container, err := pickContainer(opts.Container, containerNames)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rc, err := s.docker.Logs(r.Context(), ContainerName(uid, container), opts)
 	if err != nil {
 		if IsContainerNotFound(err) {
 			http.Error(w, fmt.Sprintf("no container for pod %s/%s yet", ns, name), http.StatusNotFound)
@@ -183,6 +195,9 @@ func parseLogOptions(q map[string][]string) (LogOptions, error) {
 		}
 		return ""
 	}
+	if v := get("container"); v != "" {
+		out.Container = v
+	}
 	if v := get("follow"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -219,6 +234,28 @@ func parseLogOptions(q map[string][]string) (LogOptions, error) {
 		out.LimitBytes = &n
 	}
 	return out, nil
+}
+
+// pickContainer mirrors `kubectl logs` behaviour: a single-container Pod
+// implicitly selects that container; a multi-container Pod requires the
+// caller to name one explicitly. Returns the chosen container name or a
+// human-readable error suitable for HTTP 400.
+func pickContainer(requested string, available []string) (string, error) {
+	if requested != "" {
+		for _, n := range available {
+			if n == requested {
+				return n, nil
+			}
+		}
+		return "", fmt.Errorf("container %q is not in pod (have: %v)", requested, available)
+	}
+	if len(available) == 1 {
+		return available[0], nil
+	}
+	if len(available) == 0 {
+		return "", fmt.Errorf("pod has no containers")
+	}
+	return "", fmt.Errorf("a container name must be specified for pods with multiple containers (have: %v)", available)
 }
 
 // parseLogOptions terminates the file.

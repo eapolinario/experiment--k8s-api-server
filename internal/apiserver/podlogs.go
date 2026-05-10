@@ -181,6 +181,9 @@ func encodeLogQuery(o *corev1.PodLogOptions) string {
 		return ""
 	}
 	v := url.Values{}
+	if o.Container != "" {
+		v.Set("container", o.Container)
+	}
 	if o.Follow {
 		v.Set("follow", "true")
 	}

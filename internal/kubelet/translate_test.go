@@ -21,7 +21,7 @@ func mkPod(name string, containers []corev1.Container) *corev1.Pod {
 	}
 }
 
-func TestContainerSpecFromPod_Basic(t *testing.T) {
+func TestContainerSpecsFromPod_Basic(t *testing.T) {
 	pod := mkPod("nginx", []corev1.Container{{
 		Name:       "nginx",
 		Image:      "nginx:1.27-alpine",
@@ -34,10 +34,14 @@ func TestContainerSpecFromPod_Basic(t *testing.T) {
 		},
 	}})
 
-	spec, err := ContainerSpecFromPod(context.Background(), nil, pod, "")
+	specs, err := ContainerSpecsFromPod(context.Background(), nil, pod, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if len(specs) != 1 {
+		t.Fatalf("len(specs)=%d want 1", len(specs))
+	}
+	spec := specs[0]
 	if spec.Image != "nginx:1.27-alpine" {
 		t.Errorf("image = %q", spec.Image)
 	}
@@ -56,25 +60,54 @@ func TestContainerSpecFromPod_Basic(t *testing.T) {
 	if spec.Labels[LabelPodUID] != "uid-nginx" {
 		t.Errorf("missing uid label: %v", spec.Labels)
 	}
+	if spec.Labels[LabelContainerName] != "nginx" {
+		t.Errorf("missing container-name label: %v", spec.Labels)
+	}
 	if spec.Labels[LabelManagedBy] != ManagedByValue {
 		t.Errorf("missing managed-by label: %v", spec.Labels)
 	}
 	if spec.PullPolicy != corev1.PullIfNotPresent {
 		t.Errorf("pull policy = %q (want IfNotPresent for tagged image)", spec.PullPolicy)
 	}
+	if spec.NetworkMode != "" {
+		t.Errorf("single-container NetworkMode=%q want empty (default bridge)", spec.NetworkMode)
+	}
 }
 
-func TestContainerSpecFromPod_RejectsMultiContainer(t *testing.T) {
-	pod := mkPod("multi", []corev1.Container{
-		{Name: "a", Image: "alpine"},
-		{Name: "b", Image: "alpine"},
+func TestContainerSpecsFromPod_MultiContainerSharesNetns(t *testing.T) {
+	pod := mkPod("web", []corev1.Container{
+		{Name: "main", Image: "nginx"},
+		{Name: "sidecar", Image: "alpine"},
+		{Name: "shipper", Image: "busybox"},
 	})
-	if _, err := ContainerSpecFromPod(context.Background(), nil, pod, ""); err == nil {
-		t.Fatal("expected error for multi-container pod")
+	specs, err := ContainerSpecsFromPod(context.Background(), nil, pod, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	if len(specs) != 3 {
+		t.Fatalf("len(specs)=%d want 3", len(specs))
+	}
+	if specs[0].NetworkMode != "" {
+		t.Errorf("sandbox NetworkMode=%q want empty", specs[0].NetworkMode)
+	}
+	wantSandbox := "container:" + ContainerName(string(pod.UID), "main")
+	for i := 1; i < len(specs); i++ {
+		if specs[i].NetworkMode != wantSandbox {
+			t.Errorf("specs[%d].NetworkMode=%q want %q", i, specs[i].NetworkMode, wantSandbox)
+		}
+	}
+	// Each container must carry its own LabelContainerName.
+	for i, s := range specs {
+		want := pod.Spec.Containers[i].Name
+		if s.Labels[LabelContainerName] != want {
+			t.Errorf("specs[%d].Labels[container.name]=%q want %q", i, s.Labels[LabelContainerName], want)
+		}
+	}
+}
 
+func TestContainerSpecsFromPod_RejectsZeroContainers(t *testing.T) {
 	empty := mkPod("empty", nil)
-	if _, err := ContainerSpecFromPod(context.Background(), nil, empty, ""); err == nil {
+	if _, err := ContainerSpecsFromPod(context.Background(), nil, empty, ""); err == nil {
 		t.Fatal("expected error for zero-container pod")
 	}
 }
@@ -104,65 +137,101 @@ func TestResolvePullPolicy(t *testing.T) {
 	}
 }
 
-func TestPodStatusFromView_Running(t *testing.T) {
-	pod := mkPod("nginx", []corev1.Container{{Name: "nginx", Image: "nginx:1.27-alpine"}})
-	v := ContainerView{
-		ID:        "abc123",
-		Image:     "nginx:1.27-alpine",
-		ImageID:   "sha256:deadbeef",
-		Running:   true,
-		StartedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+func TestPodStatusFromViews_AllRunning(t *testing.T) {
+	pod := mkPod("web", []corev1.Container{
+		{Name: "nginx", Image: "nginx:1.27-alpine"},
+		{Name: "sidecar", Image: "alpine"},
+	})
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	views := map[string]ContainerView{
+		"nginx":   {ID: "a", Image: "nginx:1.27-alpine", ImageID: "sha256:1", Running: true, StartedAt: start},
+		"sidecar": {ID: "b", Image: "alpine", ImageID: "sha256:2", Running: true, StartedAt: start.Add(time.Second)},
 	}
-	st := PodStatusFromView(pod, v)
+	st := PodStatusFromViews(pod, views)
 	if st.Phase != corev1.PodRunning {
 		t.Errorf("phase = %q", st.Phase)
 	}
-	if st.PodIP != PlaceholderPodIP || st.HostIP != PlaceholderHostIP {
-		t.Errorf("ips = %q / %q", st.PodIP, st.HostIP)
+	if len(st.ContainerStatuses) != 2 {
+		t.Fatalf("container statuses: %d want 2", len(st.ContainerStatuses))
 	}
-	if st.StartTime == nil {
-		t.Fatalf("missing startTime")
+	if st.ContainerStatuses[0].Name != "nginx" || st.ContainerStatuses[1].Name != "sidecar" {
+		t.Errorf("container order: %+v", st.ContainerStatuses)
 	}
-	if len(st.ContainerStatuses) != 1 {
-		t.Fatalf("container statuses: %v", st.ContainerStatuses)
+	for _, cs := range st.ContainerStatuses {
+		if !cs.Ready || cs.State.Running == nil {
+			t.Errorf("cs not running ready: %+v", cs)
+		}
 	}
-	cs := st.ContainerStatuses[0]
-	if !cs.Ready || cs.State.Running == nil || cs.ContainerID != "docker://abc123" {
-		t.Errorf("bad running cs: %+v", cs)
+	if st.StartTime == nil || !st.StartTime.Time.Equal(start) {
+		t.Errorf("startTime=%v want earliest=%v", st.StartTime, start)
 	}
 }
 
-func TestPodStatusFromView_ExitedNonZero(t *testing.T) {
-	pod := mkPod("sh", []corev1.Container{{Name: "sh", Image: "alpine"}})
-	v := ContainerView{
-		ID:         "x",
-		Running:    false,
-		ExitCode:   137,
-		OOMKilled:  true,
-		StartedAt:  time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		FinishedAt: time.Date(2025, 1, 1, 0, 1, 0, 0, time.UTC),
+func TestPodStatusFromViews_AnyMissingPending(t *testing.T) {
+	pod := mkPod("web", []corev1.Container{
+		{Name: "a", Image: "alpine"},
+		{Name: "b", Image: "alpine"},
+	})
+	views := map[string]ContainerView{
+		"a": {ID: "x", Running: true, StartedAt: time.Now()},
 	}
-	st := PodStatusFromView(pod, v)
+	st := PodStatusFromViews(pod, views)
+	if st.Phase != corev1.PodPending {
+		t.Errorf("phase = %q want Pending", st.Phase)
+	}
+	if st.ContainerStatuses[1].State.Waiting == nil || st.ContainerStatuses[1].State.Waiting.Reason != "ContainerCreating" {
+		t.Errorf("missing container should be Waiting/ContainerCreating: %+v", st.ContainerStatuses[1])
+	}
+}
+
+func TestPodStatusFromViews_AnyFailedFails(t *testing.T) {
+	pod := mkPod("web", []corev1.Container{
+		{Name: "main", Image: "alpine"},
+		{Name: "side", Image: "alpine"},
+	})
+	views := map[string]ContainerView{
+		"main": {ID: "x", Running: true, StartedAt: time.Now()},
+		"side": {ID: "y", Running: false, ExitCode: 137, OOMKilled: true},
+	}
+	st := PodStatusFromViews(pod, views)
 	if st.Phase != corev1.PodFailed {
-		t.Errorf("phase = %q", st.Phase)
+		t.Errorf("phase = %q want Failed", st.Phase)
 	}
-	cs := st.ContainerStatuses[0]
-	if cs.State.Terminated == nil || cs.State.Terminated.Reason != "OOMKilled" {
-		t.Errorf("bad terminated state: %+v", cs)
-	}
-	if cs.Ready {
-		t.Errorf("ready should be false on exit")
+	if st.Message == "" {
+		t.Errorf("expected non-empty failure message")
 	}
 }
 
-func TestPodStatusFromView_ExitedZero(t *testing.T) {
-	pod := mkPod("sh", []corev1.Container{{Name: "sh", Image: "alpine"}})
-	v := ContainerView{ID: "x", Running: false, ExitCode: 0}
-	st := PodStatusFromView(pod, v)
-	if st.Phase != corev1.PodSucceeded {
-		t.Errorf("phase = %q", st.Phase)
+func TestPodStatusFromViews_AllSucceeded(t *testing.T) {
+	pod := mkPod("job", []corev1.Container{{Name: "a", Image: "alpine"}, {Name: "b", Image: "alpine"}})
+	views := map[string]ContainerView{
+		"a": {ID: "x", Running: false, ExitCode: 0},
+		"b": {ID: "y", Running: false, ExitCode: 0},
 	}
-	if st.ContainerStatuses[0].State.Terminated.Reason != "Completed" {
-		t.Errorf("reason = %q", st.ContainerStatuses[0].State.Terminated.Reason)
+	st := PodStatusFromViews(pod, views)
+	if st.Phase != corev1.PodSucceeded {
+		t.Errorf("phase = %q want Succeeded", st.Phase)
+	}
+	for _, cs := range st.ContainerStatuses {
+		if cs.State.Terminated == nil || cs.State.Terminated.Reason != "Completed" {
+			t.Errorf("reason = %+v", cs.State.Terminated)
+		}
+	}
+}
+
+func TestPodStatusFromViews_RunningPlusCompletedSidecarStaysRunning(t *testing.T) {
+	// Mirror real k8s: a sidecar that exits 0 while the main is still
+	// Running keeps the pod in Running phase.
+	pod := mkPod("web", []corev1.Container{
+		{Name: "main", Image: "alpine"},
+		{Name: "side", Image: "alpine"},
+	})
+	views := map[string]ContainerView{
+		"main": {ID: "x", Running: true, StartedAt: time.Now()},
+		"side": {ID: "y", Running: false, ExitCode: 0},
+	}
+	st := PodStatusFromViews(pod, views)
+	if st.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q want Running (sidecar exit 0 while main still up)", st.Phase)
 	}
 }

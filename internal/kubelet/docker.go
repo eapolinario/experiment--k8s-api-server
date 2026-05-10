@@ -23,6 +23,7 @@ import (
 // LogOptions are the parameters supported by DockerRuntime.Logs. They
 // mirror a small subset of corev1.PodLogOptions.
 type LogOptions struct {
+	Container    string // pod-container name; empty = caller must default
 	Follow       bool
 	Timestamps   bool
 	TailLines    *int64
@@ -33,13 +34,22 @@ type LogOptions struct {
 // DockerRuntime is a thin wrapper over the Docker SDK with only the methods
 // kubelet-lite uses. It exists so the reconciler depends on a small, easy-to-
 // fake interface instead of the full SDK surface.
+// ManagedContainer is one Docker container with our LabelPodUID label.
+// Returned by ListManagedContainers; used by the orphan reaper +
+// reapByUID to address every container belonging to a Pod.
+type ManagedContainer struct {
+	UID           string // io.k8s.pod.uid label
+	ContainerName string // io.k8s.container.name label (pod-container name)
+	DockerName    string // docker container name (no leading slash)
+}
+
 type DockerRuntime interface {
 	EnsurePulled(ctx context.Context, ref string, policy string) error
 	CreateAndStart(ctx context.Context, name string, spec ContainerSpec) (string, error)
 	Inspect(ctx context.Context, name string) (ContainerView, bool, error)
 	Stop(ctx context.Context, name string, gracePeriod time.Duration) error
 	Remove(ctx context.Context, name string) error
-	ListManagedUIDs(ctx context.Context) (map[string]string, error) // uid -> container name
+	ListManagedContainers(ctx context.Context) ([]ManagedContainer, error)
 	Logs(ctx context.Context, name string, opts LogOptions) (io.ReadCloser, error)
 	Close() error
 }
@@ -144,6 +154,9 @@ func (r *dockerRT) CreateAndStart(ctx context.Context, name string, spec Contain
 	}
 	host := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
+	}
+	if spec.NetworkMode != "" {
+		host.NetworkMode = container.NetworkMode(spec.NetworkMode)
 	}
 	for _, m := range spec.Mounts {
 		host.Mounts = append(host.Mounts, mount.Mount{
@@ -283,25 +296,28 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (r *dockerRT) ListManagedUIDs(ctx context.Context) (map[string]string, error) {
+func (r *dockerRT) ListManagedContainers(ctx context.Context) ([]ManagedContainer, error) {
 	args := filters.NewArgs(filters.KeyValuePair{Key: "label", Value: LabelPodUID})
 	containers, err := r.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: args})
 	if err != nil {
 		return nil, fmt.Errorf("ContainerList: %w", err)
 	}
-	out := make(map[string]string, len(containers))
+	out := make([]ManagedContainer, 0, len(containers))
 	for _, c := range containers {
 		uid := c.Labels[LabelPodUID]
 		if uid == "" {
 			continue
 		}
-		// Pick the first matching name (stripping leading slash).
 		var name string
 		for _, n := range c.Names {
 			name = strings.TrimPrefix(n, "/")
 			break
 		}
-		out[uid] = name
+		out = append(out, ManagedContainer{
+			UID:           uid,
+			ContainerName: c.Labels[LabelContainerName],
+			DockerName:    name,
+		})
 	}
 	return out, nil
 }

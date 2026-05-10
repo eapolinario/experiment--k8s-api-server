@@ -19,8 +19,9 @@ const (
 	LabelManagedBy    = "io.k8s.managed-by"
 	ManagedByValue    = "kubelet-lite"
 
-	// ContainerNamePrefix is prepended to the Pod UID to form the Docker
-	// container name (Docker accepts [a-zA-Z0-9_.-]; UIDs use hyphens).
+	// ContainerNamePrefix is prepended to <PodUID>_<ContainerName> to form
+	// the Docker container name (Docker accepts [a-zA-Z0-9_.-]; UIDs use
+	// hyphens, container names are DNS-label-safe).
 	ContainerNamePrefix = "klite_"
 
 	// PlaceholderPodIP is reported on every Running pod. The Docker bridge
@@ -30,19 +31,29 @@ const (
 	PlaceholderHostIP = "127.0.0.1"
 )
 
-// ContainerNameForUID returns the Docker container name for a given Pod UID.
-func ContainerNameForUID(uid string) string {
-	return ContainerNamePrefix + uid
+// ContainerName returns the Docker container name for a given Pod UID +
+// pod-container name. The two-part scheme lets us host multiple containers
+// per Pod and still recover the (uid, container) tuple from a label scan.
+func ContainerName(uid, containerName string) string {
+	return ContainerNamePrefix + uid + "_" + containerName
 }
 
-// PodLabelsFor returns the canonical Docker labels we attach to every
-// container managed by kubelet-lite.
-func PodLabelsFor(pod *corev1.Pod) map[string]string {
+// LabelContainerName is the docker label carrying the pod-container name
+// (the value of pod.spec.containers[i].name). Combined with LabelPodUID
+// it uniquely identifies a managed container.
+const LabelContainerName = "io.k8s.container.name"
+
+// PodLabelsFor returns the canonical Docker labels we attach to a
+// container managed by kubelet-lite. containerName is the value of
+// pod.spec.containers[i].name and is required so the orphan reaper +
+// log server can pick a specific container out of a multi-container Pod.
+func PodLabelsFor(pod *corev1.Pod, containerName string) map[string]string {
 	return map[string]string{
-		LabelPodUID:       string(pod.UID),
-		LabelPodNamespace: pod.Namespace,
-		LabelPodName:      pod.Name,
-		LabelManagedBy:    ManagedByValue,
+		LabelPodUID:        string(pod.UID),
+		LabelPodNamespace:  pod.Namespace,
+		LabelPodName:       pod.Name,
+		LabelContainerName: containerName,
+		LabelManagedBy:     ManagedByValue,
 	}
 }
 
@@ -57,65 +68,83 @@ type ContainerSpec struct {
 	WorkingDir  string
 	Labels      map[string]string
 	PullPolicy  corev1.PullPolicy
-	ContainerNm string      // single Pod container name (informational)
+	ContainerNm string      // pod-container name (pod.spec.containers[i].name)
 	Mounts      []HostMount // bind mounts for projected ConfigMap/Secret volumes
+	// NetworkMode controls Docker HostConfig.NetworkMode. Empty string
+	// uses Docker's default (bridge). For sibling containers in a
+	// multi-container Pod we set this to "container:<sandboxName>" so
+	// every container shares the first container's netns — the same
+	// trick real kubelet uses with its pause sandbox, minus the pause.
+	NetworkMode string
 }
 
-// ContainerSpecFromPod translates a Pod into a ContainerSpec. It assumes the
-// Pod has exactly one container; callers must check this before invoking.
+// ContainerSpecsFromPod translates every container in pod.Spec.Containers
+// into a ContainerSpec, in spec order. The first container is the netns
+// "sandbox": its NetworkMode is left blank (default bridge). Every
+// subsequent container's NetworkMode is set to "container:<sandboxName>"
+// so siblings join the sandbox's netns (same loopback, same published
+// ports). Pods with zero containers are rejected.
 //
-// kube + volumeRoot are used to resolve env / envFrom against ConfigMap /
-// Secret objects in the apiserver and to materialise volume projections
-// onto the host filesystem. Pass nil kube + empty volumeRoot for legacy
-// callers / tests that don't exercise projection (env.valueFrom and
-// volumes will be skipped with a warning in that case).
-func ContainerSpecFromPod(ctx context.Context, kube kubernetes.Interface, pod *corev1.Pod, volumeRoot string) (ContainerSpec, error) {
-	if len(pod.Spec.Containers) != 1 {
-		return ContainerSpec{}, fmt.Errorf("kubelet-lite v1 supports exactly one container per Pod (got %d)", len(pod.Spec.Containers))
+// kube + volumeRoot work as before — see resolveEnv / projectVolumes.
+func ContainerSpecsFromPod(ctx context.Context, kube kubernetes.Interface, pod *corev1.Pod, volumeRoot string) ([]ContainerSpec, error) {
+	if len(pod.Spec.Containers) == 0 {
+		return nil, fmt.Errorf("pod %s/%s has zero containers", pod.Namespace, pod.Name)
 	}
-	c := pod.Spec.Containers[0]
+	uid := string(pod.UID)
+	sandboxName := ContainerName(uid, pod.Spec.Containers[0].Name)
 
-	var env []string
-	var mounts []HostMount
-	if kube != nil {
-		var err error
-		if env, err = resolveEnv(ctx, kube, pod.Namespace, &c); err != nil {
-			return ContainerSpec{}, err
-		}
-		if mounts, err = projectVolumes(ctx, kube, pod, &c, volumeRoot); err != nil {
-			return ContainerSpec{}, err
-		}
-	} else {
-		// Legacy / test path: literal env values only, no projection.
-		env = make([]string, 0, len(c.Env))
-		for _, e := range c.Env {
-			if e.ValueFrom != nil {
-				klog.Warningf("pod %s/%s container %q: env %q uses valueFrom but no kube client provided; skipping", pod.Namespace, pod.Name, c.Name, e.Name)
-				continue
+	specs := make([]ContainerSpec, 0, len(pod.Spec.Containers))
+	for i := range pod.Spec.Containers {
+		c := pod.Spec.Containers[i]
+
+		var env []string
+		var mounts []HostMount
+		if kube != nil {
+			var err error
+			if env, err = resolveEnv(ctx, kube, pod.Namespace, &c); err != nil {
+				return nil, fmt.Errorf("container %q: %w", c.Name, err)
 			}
-			env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
+			if mounts, err = projectVolumes(ctx, kube, pod, &c, volumeRoot); err != nil {
+				return nil, fmt.Errorf("container %q: %w", c.Name, err)
+			}
+		} else {
+			env = make([]string, 0, len(c.Env))
+			for _, e := range c.Env {
+				if e.ValueFrom != nil {
+					klog.Warningf("pod %s/%s container %q: env %q uses valueFrom but no kube client provided; skipping", pod.Namespace, pod.Name, c.Name, e.Name)
+					continue
+				}
+				env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
+			}
 		}
-	}
 
-	var cmd, entrypoint []string
-	if len(c.Command) > 0 {
-		entrypoint = append(entrypoint, c.Command...)
-	}
-	if len(c.Args) > 0 {
-		cmd = append(cmd, c.Args...)
-	}
+		var cmd, entrypoint []string
+		if len(c.Command) > 0 {
+			entrypoint = append(entrypoint, c.Command...)
+		}
+		if len(c.Args) > 0 {
+			cmd = append(cmd, c.Args...)
+		}
 
-	return ContainerSpec{
-		Image:       c.Image,
-		Cmd:         cmd,
-		Entrypoint:  entrypoint,
-		Env:         env,
-		WorkingDir:  c.WorkingDir,
-		Labels:      PodLabelsFor(pod),
-		PullPolicy:  ResolvePullPolicy(c.ImagePullPolicy, c.Image),
-		ContainerNm: c.Name,
-		Mounts:      mounts,
-	}, nil
+		netMode := ""
+		if i > 0 {
+			netMode = "container:" + sandboxName
+		}
+
+		specs = append(specs, ContainerSpec{
+			Image:       c.Image,
+			Cmd:         cmd,
+			Entrypoint:  entrypoint,
+			Env:         env,
+			WorkingDir:  c.WorkingDir,
+			Labels:      PodLabelsFor(pod, c.Name),
+			PullPolicy:  ResolvePullPolicy(c.ImagePullPolicy, c.Image),
+			ContainerNm: c.Name,
+			Mounts:      mounts,
+			NetworkMode: netMode,
+		})
+	}
+	return specs, nil
 }
 
 // ResolvePullPolicy returns the effective pull policy. The Kubernetes default
@@ -176,79 +205,119 @@ type ContainerView struct {
 	OOMKilled  bool
 }
 
-// PodStatusFromView builds a corev1.PodStatus reflecting the observed
-// container state. The pod's ObjectMeta is used only for the container name
-// echo in containerStatuses.
-func PodStatusFromView(pod *corev1.Pod, v ContainerView) corev1.PodStatus {
+// PodStatusFromViews builds a corev1.PodStatus reflecting per-container
+// observed state. views maps pod-container name -> ContainerView; missing
+// entries (container not yet created) become a Waiting ContainerStatus.
+//
+// Phase aggregation:
+//   * any container missing or waiting   -> Pending
+//   * all containers Running             -> Running
+//   * all terminated, all exit 0         -> Succeeded
+//   * any terminated with exit != 0      -> Failed
+//   * mixed running + terminated-zero    -> Running (the terminated one
+//     is just "done early", same as a sidecar that completed)
+func PodStatusFromViews(pod *corev1.Pod, views map[string]ContainerView) corev1.PodStatus {
 	now := metav1Now()
-	containerName := ""
-	if len(pod.Spec.Containers) == 1 {
-		containerName = pod.Spec.Containers[0].Name
-	}
-
-	cs := corev1.ContainerStatus{
-		Name:         containerName,
-		Image:        v.Image,
-		ImageID:      v.ImageID,
-		ContainerID:  "docker://" + v.ID,
-		Ready:        v.Running,
-		RestartCount: 0,
-	}
 
 	status := corev1.PodStatus{
 		HostIP: PlaceholderHostIP,
 		PodIP:  PlaceholderPodIP,
 	}
 
-	if v.Running {
-		started := v.StartedAt
-		if started.IsZero() {
-			started = now.Time
-		}
-		t := metav1NewTime(started)
-		cs.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: t}}
-		status.Phase = corev1.PodRunning
-		status.StartTime = &t
-	} else {
-		reason := "Completed"
-		if v.ExitCode != 0 {
-			reason = "Error"
-		}
-		if v.OOMKilled {
-			reason = "OOMKilled"
-		}
-		fin := v.FinishedAt
-		if fin.IsZero() {
-			fin = now.Time
-		}
-		startedT := metav1NewTime(v.StartedAt)
-		cs.State = corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{
-				ExitCode:    int32(v.ExitCode),
-				Reason:      reason,
-				StartedAt:   startedT,
-				FinishedAt:  metav1NewTime(fin),
-				ContainerID: "docker://" + v.ID,
-			},
-		}
-		cs.Ready = false
-		if v.ExitCode == 0 && !v.OOMKilled {
-			status.Phase = corev1.PodSucceeded
-		} else {
-			status.Phase = corev1.PodFailed
+	containerStatuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+	var (
+		anyMissing       bool
+		anyRunning       bool
+		anyFailed        bool
+		allTerminated   = true
+		earliestStart   time.Time
+		failMessage     string
+	)
+
+	for _, c := range pod.Spec.Containers {
+		v, ok := views[c.Name]
+		cs := corev1.ContainerStatus{Name: c.Name, Image: c.Image, RestartCount: 0}
+		switch {
+		case !ok:
+			// Not yet created.
+			cs.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
+			anyMissing = true
+			allTerminated = false
+		case v.Running:
+			started := v.StartedAt
+			if started.IsZero() {
+				started = now.Time
+			}
+			t := metav1NewTime(started)
+			cs.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: t}}
+			cs.Ready = true
+			cs.Image = v.Image
+			cs.ImageID = v.ImageID
+			cs.ContainerID = "docker://" + v.ID
+			anyRunning = true
+			allTerminated = false
+			if earliestStart.IsZero() || started.Before(earliestStart) {
+				earliestStart = started
+			}
+		default:
+			reason := "Completed"
+			if v.ExitCode != 0 {
+				reason = "Error"
+			}
 			if v.OOMKilled {
-				status.Message = fmt.Sprintf("container OOMKilled (exit code %d)", v.ExitCode)
-			} else {
-				status.Message = fmt.Sprintf("container exited with code %d", v.ExitCode)
+				reason = "OOMKilled"
+			}
+			fin := v.FinishedAt
+			if fin.IsZero() {
+				fin = now.Time
+			}
+			cs.State = corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					ExitCode:    int32(v.ExitCode),
+					Reason:      reason,
+					StartedAt:   metav1NewTime(v.StartedAt),
+					FinishedAt:  metav1NewTime(fin),
+					ContainerID: "docker://" + v.ID,
+				},
+			}
+			cs.Ready = false
+			cs.Image = v.Image
+			cs.ImageID = v.ImageID
+			cs.ContainerID = "docker://" + v.ID
+			if v.ExitCode != 0 || v.OOMKilled {
+				anyFailed = true
+				if v.OOMKilled {
+					failMessage = fmt.Sprintf("container %q OOMKilled (exit code %d)", c.Name, v.ExitCode)
+				} else {
+					failMessage = fmt.Sprintf("container %q exited with code %d", c.Name, v.ExitCode)
+				}
+			}
+			if !v.StartedAt.IsZero() && (earliestStart.IsZero() || v.StartedAt.Before(earliestStart)) {
+				earliestStart = v.StartedAt
 			}
 		}
-		if !v.StartedAt.IsZero() {
-			t := metav1NewTime(v.StartedAt)
-			status.StartTime = &t
-		}
+		containerStatuses = append(containerStatuses, cs)
 	}
 
-	status.ContainerStatuses = []corev1.ContainerStatus{cs}
+	switch {
+	case anyFailed:
+		status.Phase = corev1.PodFailed
+		status.Message = failMessage
+	case anyMissing:
+		status.Phase = corev1.PodPending
+	case anyRunning:
+		status.Phase = corev1.PodRunning
+	case allTerminated:
+		status.Phase = corev1.PodSucceeded
+	default:
+		status.Phase = corev1.PodPending
+	}
+
+	if !earliestStart.IsZero() {
+		t := metav1NewTime(earliestStart)
+		status.StartTime = &t
+	}
+	status.ContainerStatuses = containerStatuses
 	return status
 }
 
