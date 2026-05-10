@@ -113,6 +113,18 @@ func newPodGracefulStrategy(typer runtime.ObjectTyper) *podGracefulStrategy {
 	return &podGracefulStrategy{objectStrategy: newPodStrategy(typer)}
 }
 
+// newEventStrategy returns a strategy for corev1.Event. Events have no
+// status subresource and no graceful delete; they're effectively a typed
+// log line. We allow create-on-update so kubelet can use SSA-like upserts
+// in the future without breaking existing PUT semantics.
+func newEventStrategy(typer runtime.ObjectTyper) *objectStrategy {
+	return &objectStrategy{
+		ObjectTyper:     typer,
+		NameGenerator:   names.SimpleNameGenerator,
+		namespaceScoped: true,
+	}
+}
+
 func (podGracefulStrategy) CheckGracefulDelete(_ context.Context, obj runtime.Object, options *metav1.DeleteOptions) bool {
 	if options == nil {
 		return false

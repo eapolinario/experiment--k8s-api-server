@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,5 +178,51 @@ func TestPodTableConvertor_TerminatingPod(t *testing.T) {
 	}
 	if tbl.Rows[0].Cells[2] != "Terminating" {
 		t.Errorf("status cell=%v want Terminating", tbl.Rows[0].Cells[2])
+	}
+}
+
+func TestEventTableConvertor_Row(t *testing.T) {
+	now := metav1.NewTime(time.Now().Add(-90 * time.Second))
+	e := &corev1.Event{
+		ObjectMeta:    metav1.ObjectMeta{Name: "nginx.abc", Namespace: "default"},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "nginx", Namespace: "default"},
+		Reason:        "Pulled",
+		Message:       "Successfully pulled image \"nginx\"",
+		Type:          corev1.EventTypeNormal,
+		FirstTimestamp: now, LastTimestamp: now,
+		Source: corev1.EventSource{Component: "kubelet-lite"},
+	}
+	tbl, err := eventTableConvertor{}.ConvertToTable(context.Background(), e, nil)
+	if err != nil {
+		t.Fatalf("ConvertToTable: %v", err)
+	}
+	if len(tbl.Rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(tbl.Rows))
+	}
+	row := tbl.Rows[0]
+	want := []interface{}{"1m" /* age */, "Normal", "Pulled", "Pod/nginx", "Successfully pulled image \"nginx\""}
+	for i := 1; i < len(want); i++ {
+		if row.Cells[i] != want[i] {
+			t.Errorf("cell[%d]=%v want %v", i, row.Cells[i], want[i])
+		}
+	}
+	if !strings.HasSuffix(row.Cells[0].(string), "s") && !strings.HasSuffix(row.Cells[0].(string), "m") {
+		t.Errorf("age cell=%q expected duration-like suffix", row.Cells[0])
+	}
+}
+
+func TestEventLastSeen_FallsBackThroughTimestamps(t *testing.T) {
+	zero := metav1.Time{}
+	a := metav1.NewTime(time.Now().Add(-time.Hour))
+	b := metav1.NewTime(time.Now().Add(-time.Minute))
+	if got := eventLastSeen(&corev1.Event{LastTimestamp: b, FirstTimestamp: a}); !got.Equal(&b) {
+		t.Errorf("LastTimestamp should win, got %v", got)
+	}
+	if got := eventLastSeen(&corev1.Event{LastTimestamp: zero, FirstTimestamp: a}); !got.Equal(&a) {
+		t.Errorf("FirstTimestamp fallback failed, got %v", got)
+	}
+	mt := metav1.NewMicroTime(a.Time)
+	if got := eventLastSeen(&corev1.Event{EventTime: mt}); !got.Time.Equal(a.Time) {
+		t.Errorf("EventTime fallback failed, got %v", got)
 	}
 }

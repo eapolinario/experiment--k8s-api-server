@@ -114,6 +114,68 @@ func (namespaceTableConvertor) ConvertToTable(_ context.Context, object runtime.
 	return t, nil
 }
 
+// eventTableConvertor renders events as LAST SEEN / TYPE / REASON / OBJECT / MESSAGE,
+// matching `kubectl get events`.
+type eventTableConvertor struct{}
+
+var _ rest.TableConvertor = eventTableConvertor{}
+
+var eventColumns = []metav1.TableColumnDefinition{
+	{Name: "Last Seen", Type: "string", Description: "Time since LastTimestamp"},
+	{Name: "Type", Type: "string", Description: "Normal or Warning"},
+	{Name: "Reason", Type: "string", Description: "Short, machine-readable cause"},
+	{Name: "Object", Type: "string", Description: "<kind>/<name> the event refers to"},
+	{Name: "Message", Type: "string", Description: "Human-readable detail"},
+}
+
+func (eventTableConvertor) ConvertToTable(_ context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	t := &metav1.Table{}
+	if !tableNoHeaders(tableOptions) {
+		t.ColumnDefinitions = eventColumns
+	}
+	add := func(e *corev1.Event) {
+		lastStr := translateTimestampSince(eventLastSeen(e))
+		objStr := fmt.Sprintf("%s/%s", e.InvolvedObject.Kind, e.InvolvedObject.Name)
+		t.Rows = append(t.Rows, metav1.TableRow{
+			Cells: []interface{}{
+				lastStr,
+				e.Type,
+				e.Reason,
+				objStr,
+				e.Message,
+			},
+			Object: runtime.RawExtension{Object: e},
+		})
+	}
+	switch o := object.(type) {
+	case *corev1.Event:
+		add(o)
+	case *corev1.EventList:
+		t.ResourceVersion = o.ResourceVersion
+		for i := range o.Items {
+			add(&o.Items[i])
+		}
+	default:
+		return nil, fmt.Errorf("eventTableConvertor: unexpected type %T", object)
+	}
+	return t, nil
+}
+
+// eventLastSeen picks the best available timestamp for the LAST SEEN column.
+// Order: LastTimestamp -> FirstTimestamp -> EventTime -> CreationTimestamp.
+func eventLastSeen(e *corev1.Event) metav1.Time {
+	if !e.LastTimestamp.IsZero() {
+		return e.LastTimestamp
+	}
+	if !e.FirstTimestamp.IsZero() {
+		return e.FirstTimestamp
+	}
+	if !e.EventTime.IsZero() {
+		return metav1.NewTime(e.EventTime.Time)
+	}
+	return e.CreationTimestamp
+}
+
 // podDisplayStatus mirrors the column kubectl prints in the STATUS slot:
 // terminated containers report Reason; otherwise the Pod phase. A pod with
 // metadata.deletionTimestamp set renders as "Terminating" regardless of

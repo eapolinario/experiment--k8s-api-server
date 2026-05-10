@@ -122,10 +122,13 @@ Builds a generic apiserver with `genericserver.RecommendedConfig`:
 - Authz = `AlwaysAllowAuthorizer`
 - Registered REST: `Pod`, `Pod/status` subresource, `Pod/log` subresource
   (a `rest.Connecter` that proxies streaming GETs to kubelet-lite),
-  `Namespace` — all under `/api/v1`, all backed by `fsstorage`. Custom
-  `rest.TableConvertor` impls render the columns kubectl users expect
-  (`READY`/`STATUS`/`RESTARTS`/`AGE` for pods; `STATUS`/`AGE` for ns).
-  Short names: `po`, `ns`.
+  `Namespace`, `Event` — all under `/api/v1`, all backed by `fsstorage`.
+  Custom `rest.TableConvertor` impls render the columns kubectl users
+  expect (`READY`/`STATUS`/`RESTARTS`/`AGE` for pods; `STATUS`/`AGE` for
+  ns; `LAST SEEN`/`TYPE`/`REASON`/`OBJECT`/`MESSAGE` for events).
+  Short names: `po`, `ns`, `ev`. Per-resource field-selector allowlists
+  (e.g. `involvedObject.name` for Events) are wired via
+  `scheme.AddFieldLabelConversionFunc` so `kubectl describe pod` works.
 - OpenAPI v2 disabled (vendoring `pkg/generated/openapi` would more than
   double the binary), v3 stubbed in `openapi.go` with empty schemas. This
   is why `kubectl apply` requires `--validate=false`.
@@ -146,6 +149,10 @@ A SharedIndexInformer-driven reconciler with one worker:
 - A small HTTP server on `127.0.0.1:10350` exposes
   `GET /containerLogs/{ns}/{name}` so the apiserver's `pods/log`
   subresource can stream `docker logs` output back to `kubectl logs`.
+- A minimal event recorder posts `corev1.Event` objects (one per
+  occurrence — we don't aggregate into series) for the upstream-kubelet
+  reasons `Pulling`/`Pulled`/`Failed`/`Created`/`Started`/`Killing`,
+  visible to `kubectl get events` and `kubectl describe pod`.
 
 ### Examples
 
