@@ -23,6 +23,8 @@ type resourceConfig struct {
 	singular    string // "pod"
 	prefix      string // "/pods"
 	namespaced  bool
+	shortNames  []string // e.g. ["po"]; nil for none
+	table       rest.TableConvertor // nil = use rest.NewDefaultTableConvertor
 	newFunc     func() runtime.Object
 	newListFunc func() runtime.Object
 	getAttrs    func(obj runtime.Object) (labels.Set, fields.Set, error)
@@ -100,10 +102,30 @@ func newStore(rc resourceConfig, dataRoot string, codec runtime.Codec, counter *
 
 		TableConvertor: rest.NewDefaultTableConvertor(gr),
 	}
+	if rc.table != nil {
+		store.TableConvertor = rc.table
+	}
 	store.Storage.Storage = fs
 	store.Storage.Codec = codec
 	store.ReadinessCheckFunc = fs.ReadinessCheck
 	return store, nil
+}
+
+// shortNamedStore wraps a *genericregistry.Store and adds ShortNames().
+// All other rest interfaces are promoted via the embedded pointer.
+type shortNamedStore struct {
+	*genericregistry.Store
+	shortNames []string
+}
+
+func (s *shortNamedStore) ShortNames() []string { return s.shortNames }
+
+// withShortNames wraps store iff sn is non-empty.
+func withShortNames(store *genericregistry.Store, sn []string) rest.Storage {
+	if len(sn) == 0 {
+		return store
+	}
+	return &shortNamedStore{Store: store, shortNames: sn}
 }
 
 // derivePodStatusStore returns a Store that updates only Pod /status.
