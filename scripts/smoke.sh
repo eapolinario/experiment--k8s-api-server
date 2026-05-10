@@ -150,6 +150,25 @@ else
   fail=1
 fi
 
+# Verify kubectl logs streams output from the container via the pods/log
+# subresource (apiserver -> kubelet-lite log server -> docker logs).
+echo "smoke: kubectl logs nginx"
+logs_ok=0
+for i in {1..15}; do
+  if "${KCTL[@]}" logs nginx --tail=20 2>"$RUN_DIR/kubectl-logs.err" | grep -q .; then
+    logs_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$logs_ok" -ne 1 ]]; then
+  echo "smoke: FAILED: kubectl logs nginx returned no output"
+  cat "$RUN_DIR/kubectl-logs.err" || true
+  fail=1
+else
+  echo "smoke: kubectl logs returned output"
+fi
+
 # Now delete the pod and assert teardown within 30s.
 echo "smoke: deleting pod nginx"
 if ! "${KCTL[@]}" delete pod nginx --grace-period=0 --force 2>&1; then

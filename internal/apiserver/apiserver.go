@@ -30,11 +30,12 @@ import (
 // Options configures the apiserver build. Paths default to working
 // directory relative; cmd/apiserver fills these from CLI flags.
 type Options struct {
-	BindAddress  string // host or ip; e.g. "127.0.0.1"
-	BindPort     int    // e.g. 6443
-	CertDir      string // directory containing server.crt/server.key/ca.crt
-	DataDir      string // root for fsstorage
-	ExternalHost string
+	BindAddress   string // host or ip; e.g. "127.0.0.1"
+	BindPort      int    // e.g. 6443
+	CertDir       string // directory containing server.crt/server.key/ca.crt
+	DataDir       string // root for fsstorage
+	ExternalHost  string
+	KubeletLogURL string // base URL of kubelet-lite's log server, e.g. http://127.0.0.1:10350
 }
 
 // Defaults fills sensible defaults if fields are zero-valued.
@@ -50,6 +51,9 @@ func (o *Options) Defaults() {
 	}
 	if o.ExternalHost == "" {
 		o.ExternalHost = o.BindAddress
+	}
+	if o.KubeletLogURL == "" {
+		o.KubeletLogURL = "http://127.0.0.1:10350"
 	}
 }
 
@@ -113,6 +117,11 @@ func Build(opts Options) (*genericserver.GenericAPIServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	logREST, err := newPodLogREST(opts.KubeletLogURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("pod log subresource: %w", err)
+	}
+	v1Storage["pods/log"] = logREST
 	groupInfo.VersionedResourcesStorageMap["v1"] = v1Storage
 
 	if err := server.InstallLegacyAPIGroup(genericserver.DefaultLegacyAPIPrefix, &groupInfo); err != nil {
