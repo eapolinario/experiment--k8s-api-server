@@ -42,9 +42,10 @@ import (
 // Reconciler watches Pods through the apiserver and ensures one Docker
 // container per Pod (matched by Pod UID).
 type Reconciler struct {
-	kube    kubernetes.Interface
-	docker  DockerRuntime
-	factory informers.SharedInformerFactory
+	kube     kubernetes.Interface
+	docker   DockerRuntime
+	recorder EventRecorder
+	factory  informers.SharedInformerFactory
 	lister  corelisters.PodLister
 	informer cache.SharedIndexInformer
 
@@ -67,6 +68,7 @@ func New(kube kubernetes.Interface, docker DockerRuntime, resync time.Duration) 
 	r := &Reconciler{
 		kube:           kube,
 		docker:         docker,
+		recorder:       NewEventRecorder(kube, "kubelet-lite"),
 		factory:        factory,
 		lister:         podInformer.Lister(),
 		informer:       podInformer.Informer(),
@@ -217,14 +219,20 @@ func (r *Reconciler) reconcilePod(ctx context.Context, pod *corev1.Pod) error {
 
 	if !exists {
 		// Pull then create.
+		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulling, "Pulling image %q", spec.Image)
 		if err := r.docker.EnsurePulled(ctx, spec.Image, string(spec.PullPolicy)); err != nil {
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to pull image %q: %v", spec.Image, err)
 			return r.markFailedOnce(ctx, pod, fmt.Sprintf("image pull failed: %v", err))
 		}
+		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulled, "Successfully pulled image %q", spec.Image)
 		id, err := r.docker.CreateAndStart(ctx, name, spec)
 		if err != nil {
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to create container: %v", err)
 			return r.markFailedOnce(ctx, pod, fmt.Sprintf("create/start failed: %v", err))
 		}
 		klog.Infof("started container %s id=%s for pod %s/%s", name, id, pod.Namespace, pod.Name)
+		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonCreated, "Created container: %s", spec.ContainerNm)
+		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonStarted, "Started container %s", spec.ContainerNm)
 		view, _, err = r.docker.Inspect(ctx, name)
 		if err != nil {
 			return fmt.Errorf("inspect after start: %w", err)
@@ -247,6 +255,7 @@ func (r *Reconciler) terminatePod(ctx context.Context, pod *corev1.Pod) error {
 	if _, exists, err := r.docker.Inspect(ctx, name); err != nil {
 		return fmt.Errorf("inspect during terminate: %w", err)
 	} else if exists {
+		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonKilling, "Stopping container %s (grace=%s)", name, grace)
 		if err := r.docker.Stop(ctx, name, grace); err != nil {
 			klog.Warningf("stop %s during terminate: %v", name, err)
 		}

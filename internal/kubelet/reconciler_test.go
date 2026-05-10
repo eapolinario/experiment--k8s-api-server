@@ -64,7 +64,12 @@ func mkTerminatingPod(grace int64) *corev1.Pod {
 
 // reconcilerWith builds a Reconciler around a fake kube client + provided docker.
 func reconcilerWith(kube *fake.Clientset, docker DockerRuntime) *Reconciler {
-	return &Reconciler{kube: kube, docker: docker, failedPods: map[types.UID]string{}}
+	return &Reconciler{
+		kube:       kube,
+		docker:     docker,
+		recorder:   NewEventRecorder(kube, "test-host"),
+		failedPods: map[types.UID]string{},
+	}
 }
 
 func TestTerminatePod_StopsContainerAndForceDeletes(t *testing.T) {
@@ -145,5 +150,54 @@ func TestTerminatePod_DefaultsGraceWhenSpecOmitted(t *testing.T) {
 	}
 	if doc.stopGrace != 30*time.Second {
 		t.Errorf("default grace=%s want 30s", doc.stopGrace)
+	}
+}
+
+func TestTerminatePod_EmitsKillingEvent(t *testing.T) {
+	kube := fake.NewClientset()
+	doc := &terminateDocker{exists: true}
+	r := reconcilerWith(kube, doc)
+
+	if err := r.reconcilePod(context.Background(), mkTerminatingPod(3)); err != nil {
+		t.Fatalf("reconcilePod: %v", err)
+	}
+	events, err := kube.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var killing *corev1.Event
+	for i := range events.Items {
+		if events.Items[i].Reason == EventReasonKilling {
+			killing = &events.Items[i]
+			break
+		}
+	}
+	if killing == nil {
+		t.Fatalf("expected a Killing event; got %+v", events.Items)
+	}
+	if killing.Type != corev1.EventTypeNormal {
+		t.Errorf("Killing event Type=%q want Normal", killing.Type)
+	}
+	if killing.InvolvedObject.Kind != "Pod" || killing.InvolvedObject.Name != "nginx" {
+		t.Errorf("InvolvedObject=%+v", killing.InvolvedObject)
+	}
+	if killing.Source.Component != "kubelet-lite" {
+		t.Errorf("Source.Component=%q want kubelet-lite", killing.Source.Component)
+	}
+}
+
+func TestTerminatePod_NoKillingEventWhenContainerMissing(t *testing.T) {
+	kube := fake.NewClientset()
+	doc := &terminateDocker{exists: false}
+	r := reconcilerWith(kube, doc)
+
+	if err := r.reconcilePod(context.Background(), mkTerminatingPod(3)); err != nil {
+		t.Fatalf("reconcilePod: %v", err)
+	}
+	events, _ := kube.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	for _, e := range events.Items {
+		if e.Reason == EventReasonKilling {
+			t.Errorf("did not expect Killing event when container absent: %+v", e)
+		}
 	}
 }

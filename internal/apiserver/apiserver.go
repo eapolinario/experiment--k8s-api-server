@@ -67,6 +67,7 @@ func Build(opts Options) (*genericserver.GenericAPIServer, error) {
 	utilruntime.Must(metav1.AddMetaToScheme(scheme))
 	metav1.AddToGroupVersion(scheme, corev1.SchemeGroupVersion)
 	utilruntime.Must(registerPodLogConversions(scheme))
+	utilruntime.Must(registerFieldLabelConversions(scheme))
 
 	codecs := serializer.NewCodecFactory(scheme)
 	storageCodec := codecs.LegacyCodec(corev1.SchemeGroupVersion)
@@ -198,10 +199,52 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 		return nil, err
 	}
 
+	events, err := newStore(resourceConfig{
+		resource:    "events",
+		singular:    "event",
+		prefix:      "/events",
+		namespaced:  true,
+		shortNames:  []string{"ev"},
+		table:       eventTableConvertor{},
+		newFunc:     func() runtime.Object { return &corev1.Event{} },
+		newListFunc: func() runtime.Object { return &corev1.EventList{} },
+		getAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+			e, ok := obj.(*corev1.Event)
+			if !ok {
+				return nil, nil, fmt.Errorf("not an Event: %T", obj)
+			}
+			// Subset of the field selectors real apiserver indexes for events,
+			// covering everything `kubectl describe` and `kubectl get events
+			// --field-selector` actually use in the wild.
+			return labels.Set(e.Labels), fields.Set{
+				"metadata.name":              e.Name,
+				"metadata.namespace":         e.Namespace,
+				"involvedObject.kind":        e.InvolvedObject.Kind,
+				"involvedObject.namespace":   e.InvolvedObject.Namespace,
+				"involvedObject.name":        e.InvolvedObject.Name,
+				"involvedObject.uid":         string(e.InvolvedObject.UID),
+				"involvedObject.apiVersion":  e.InvolvedObject.APIVersion,
+				"involvedObject.resourceVersion": e.InvolvedObject.ResourceVersion,
+				"involvedObject.fieldPath":   e.InvolvedObject.FieldPath,
+				"reason":                     e.Reason,
+				"reportingComponent":         e.ReportingController,
+				"source":                     e.Source.Component,
+				"type":                       e.Type,
+			}, nil
+		},
+		create: newEventStrategy(scheme),
+		update: newEventStrategy(scheme),
+		del:    newEventStrategy(scheme),
+	}, dataDir, codec, counter)
+	if err != nil {
+		return nil, err
+	}
+
 	return map[string]rest.Storage{
 		"pods":        withShortNames(pods, []string{"po"}),
 		"pods/status": podStatus,
 		"namespaces":  withShortNames(namespaces, []string{"ns"}),
+		"events":      withShortNames(events, []string{"ev"}),
 	}, nil
 }
 

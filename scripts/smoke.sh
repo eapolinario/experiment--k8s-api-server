@@ -182,6 +182,30 @@ else
   echo "smoke: kubectl logs returned output"
 fi
 
+# Events: the kubelet should have posted at least Pulled/Created/Started
+# during the pod-bringup phase. Assert they're visible via the apiserver's
+# events resource (via both `kubectl get events` and the typed list path).
+echo "smoke: kubectl get events"
+ev_table="$("${KCTL[@]}" get events -n default --field-selector involvedObject.name=nginx 2>&1)"
+echo "$ev_table"
+for want_reason in Pulling Pulled Created Started; do
+  if ! echo "$ev_table" | grep -q "$want_reason"; then
+    echo "smoke: FAIL expected event reason '$want_reason' in events list"
+    fail=1
+  fi
+done
+if [[ $fail -eq 0 ]]; then
+  echo "smoke: events Pulling/Pulled/Created/Started all present"
+fi
+
+# `kubectl describe pod` should surface the Events section.
+if "${KCTL[@]}" describe pod nginx 2>/dev/null | grep -A20 '^Events:' | grep -qE 'Pulled|Started|Pulling'; then
+  echo "smoke: kubectl describe pod nginx Events section populated"
+else
+  echo "smoke: FAIL kubectl describe pod nginx missing Events section"
+  fail=1
+fi
+
 # Now delete the pod and assert teardown within 30s.
 echo "smoke: deleting pod nginx (graceful, default 30s grace; expect Terminating phase first)"
 "${KCTL[@]}" delete pod nginx --wait=false 2>&1 | head -1 || true
