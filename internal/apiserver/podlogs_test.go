@@ -151,3 +151,39 @@ func TestNewPodLogREST_RejectsBadURL(t *testing.T) {
 		t.Errorf("expected error for malformed url")
 	}
 }
+
+func TestConvertURLValuesToPodLogOptions(t *testing.T) {
+	in := url.Values{
+		"follow":       {"true"},
+		"previous":     {"false"},
+		"timestamps":   {"true"},
+		"tailLines":    {"42"},
+		"sinceSeconds": {"60"},
+		"limitBytes":   {"4096"},
+		"container":    {"main"},
+	}
+	var out corev1.PodLogOptions
+	if err := convertURLValuesToPodLogOptions(&in, &out); err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if !out.Follow || !out.Timestamps || out.Previous {
+		t.Errorf("flags: %+v", out)
+	}
+	if out.Container != "main" {
+		t.Errorf("container=%q", out.Container)
+	}
+	if out.TailLines == nil || *out.TailLines != 42 {
+		t.Errorf("tailLines=%v", out.TailLines)
+	}
+	if out.SinceSeconds == nil || *out.SinceSeconds != 60 {
+		t.Errorf("sinceSeconds=%v", out.SinceSeconds)
+	}
+	if out.LimitBytes == nil || *out.LimitBytes != 4096 {
+		t.Errorf("limitBytes=%v", out.LimitBytes)
+	}
+
+	bad := url.Values{"tailLines": {"nope"}}
+	if err := convertURLValuesToPodLogOptions(&bad, &corev1.PodLogOptions{}); err == nil {
+		t.Errorf("expected parse error")
+	}
+}

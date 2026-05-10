@@ -66,6 +66,7 @@ func Build(opts Options) (*genericserver.GenericAPIServer, error) {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(metav1.AddMetaToScheme(scheme))
 	metav1.AddToGroupVersion(scheme, corev1.SchemeGroupVersion)
+	utilruntime.Must(registerPodLogConversions(scheme))
 
 	codecs := serializer.NewCodecFactory(scheme)
 	storageCodec := codecs.LegacyCodec(corev1.SchemeGroupVersion)
