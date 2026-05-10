@@ -11,7 +11,6 @@ package apiserver
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -106,9 +105,7 @@ func (r *podLogREST) Connect(ctx context.Context, name string, options runtime.O
 				}
 			}
 			if rerr != nil {
-				if rerr != io.EOF {
-					// Connection broken mid-stream; nothing to do — bytes already written.
-				}
+				// Connection broken or EOF; bytes already written.
 				return
 			}
 		}

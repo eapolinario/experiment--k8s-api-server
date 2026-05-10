@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+	cerrdefs "github.com/containerd/errdefs"
 	"k8s.io/klog/v2"
 )
 
@@ -63,7 +64,7 @@ func (r *dockerRT) imageExists(ctx context.Context, ref string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if dockerclient.IsErrNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		return false, nil
 	}
 	return false, err
@@ -158,7 +159,7 @@ func (r *dockerRT) CreateAndStart(ctx context.Context, name string, spec Contain
 func (r *dockerRT) Inspect(ctx context.Context, name string) (ContainerView, bool, error) {
 	insp, err := r.cli.ContainerInspect(ctx, name)
 	if err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return ContainerView{}, false, nil
 		}
 		return ContainerView{}, false, err
@@ -186,7 +187,7 @@ func (r *dockerRT) Stop(ctx context.Context, name string, gracePeriod time.Durat
 	secs := int(gracePeriod.Seconds())
 	opts := container.StopOptions{Timeout: &secs}
 	if err := r.cli.ContainerStop(ctx, name, opts); err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		return err
@@ -196,7 +197,7 @@ func (r *dockerRT) Stop(ctx context.Context, name string, gracePeriod time.Durat
 
 func (r *dockerRT) Remove(ctx context.Context, name string) error {
 	err := r.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
-	if err != nil && !dockerclient.IsErrNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 	return nil
@@ -220,7 +221,7 @@ func (r *dockerRT) Logs(ctx context.Context, name string, opts LogOptions) (io.R
 	}
 	rc, err := r.cli.ContainerLogs(ctx, name, dopts)
 	if err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, errContainerNotFound
 		}
 		return nil, fmt.Errorf("ContainerLogs(%s): %w", name, err)

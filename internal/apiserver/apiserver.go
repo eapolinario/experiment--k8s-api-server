@@ -79,28 +79,28 @@ func Build(opts Options) (*genericserver.GenericAPIServer, error) {
 
 	// --- recommended config ---
 	recommended := genericserver.NewRecommendedConfig(codecs)
-	if err := secureOpts.ApplyTo(&recommended.Config.SecureServing, &recommended.Config.LoopbackClientConfig); err != nil {
+	if err := secureOpts.ApplyTo(&recommended.SecureServing, &recommended.LoopbackClientConfig); err != nil {
 		return nil, fmt.Errorf("apply secure serving: %w", err)
 	}
 
 	// External address: <host>:<port>
-	recommended.Config.ExternalAddress = net.JoinHostPort(opts.ExternalHost, fmt.Sprintf("%d", opts.BindPort))
-	recommended.Config.PublicAddress = netutils.ParseIPSloppy(opts.BindAddress)
+	recommended.ExternalAddress = net.JoinHostPort(opts.ExternalHost, fmt.Sprintf("%d", opts.BindPort))
+	recommended.PublicAddress = netutils.ParseIPSloppy(opts.BindAddress)
 
 	// Authn = anonymous, Authz = AlwaysAllow.
-	recommended.Config.Authentication.Authenticator = anonymous.NewAuthenticator(nil)
-	recommended.Config.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
+	recommended.Authentication.Authenticator = anonymous.NewAuthenticator(nil)
+	recommended.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
 
 	// EffectiveVersion is required by Complete(); use a minimal one.
-	recommended.Config.EffectiveVersion = basecompatibility.NewEffectiveVersionFromString("1.34.0", "", "")
+	recommended.EffectiveVersion = basecompatibility.NewEffectiveVersionFromString("1.34.0", "", "")
 
 	// OpenAPI v2 is a heavy chain of metav1/version types that we don't
 	// want to inline. Skip /openapi/v2 entirely; v3 is sufficient for
 	// kubectl discovery + dynamic clients in this experiment.
 	defNamer := openapinamer.NewDefinitionNamer(scheme)
-	recommended.Config.OpenAPIConfig = nil
-	recommended.Config.OpenAPIV3Config = genericserver.DefaultOpenAPIV3Config(minimalOpenAPIDefinitions, defNamer)
-	recommended.Config.OpenAPIV3Config.Info.Title = "experiment-k8s-apiserver"
+	recommended.OpenAPIConfig = nil
+	recommended.OpenAPIV3Config = genericserver.DefaultOpenAPIV3Config(minimalOpenAPIDefinitions, defNamer)
+	recommended.OpenAPIV3Config.Info.Title = "experiment-k8s-apiserver"
 
 	// We don't run any controllers / informers / lease backed features.
 	// The recommended config defaults are otherwise fine.
