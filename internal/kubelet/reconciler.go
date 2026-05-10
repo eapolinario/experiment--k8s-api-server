@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -42,12 +43,13 @@ import (
 // Reconciler watches Pods through the apiserver and ensures one Docker
 // container per Pod (matched by Pod UID).
 type Reconciler struct {
-	kube     kubernetes.Interface
-	docker   DockerRuntime
-	recorder EventRecorder
-	factory  informers.SharedInformerFactory
-	lister  corelisters.PodLister
-	informer cache.SharedIndexInformer
+	kube       kubernetes.Interface
+	docker     DockerRuntime
+	recorder   EventRecorder
+	factory    informers.SharedInformerFactory
+	lister     corelisters.PodLister
+	informer   cache.SharedIndexInformer
+	volumeRoot string
 
 	queue   workqueue.TypedRateLimitingInterface[string]
 
@@ -60,8 +62,11 @@ type Reconciler struct {
 	failedPods map[types.UID]string
 }
 
-// New constructs a Reconciler.
-func New(kube kubernetes.Interface, docker DockerRuntime, resync time.Duration) *Reconciler {
+// New constructs a Reconciler. volumeRoot is the host directory under which
+// per-pod ConfigMap/Secret projection dirs are created and bind-mounted
+// into containers; pass "" to disable projection (env.valueFrom +
+// configmap/secret volumes will be skipped with warnings).
+func New(kube kubernetes.Interface, docker DockerRuntime, resync time.Duration, volumeRoot string) *Reconciler {
 	factory := informers.NewSharedInformerFactory(kube, resync)
 	podInformer := factory.Core().V1().Pods()
 
@@ -72,6 +77,7 @@ func New(kube kubernetes.Interface, docker DockerRuntime, resync time.Duration) 
 		factory:        factory,
 		lister:         podInformer.Lister(),
 		informer:       podInformer.Informer(),
+		volumeRoot:     volumeRoot,
 		queue:          workqueue.NewTypedRateLimitingQueueWithConfig[string](workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet-lite"}),
 		orphanInterval: 30 * time.Second,
 		failedPods:     map[types.UID]string{},
@@ -206,7 +212,7 @@ func (r *Reconciler) reconcilePod(ctx context.Context, pod *corev1.Pod) error {
 		return r.markFailedOnce(ctx, pod, msg)
 	}
 
-	spec, err := ContainerSpecFromPod(pod)
+	spec, err := ContainerSpecFromPod(ctx, r.kube, pod, r.volumeRoot)
 	if err != nil {
 		return r.markFailedOnce(ctx, pod, err.Error())
 	}
@@ -324,6 +330,11 @@ func (r *Reconciler) reapByUID(ctx context.Context, uid string) error {
 		return fmt.Errorf("remove %s: %w", name, err)
 	}
 	klog.Infof("reaped container %s (uid=%s)", name, uid)
+	if r.volumeRoot != "" {
+		if err := os.RemoveAll(PodVolumeRoot(r.volumeRoot, uid)); err != nil {
+			klog.Warningf("remove volume dir for uid %s: %v", uid, err)
+		}
+	}
 	return nil
 }
 

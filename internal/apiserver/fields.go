@@ -39,6 +39,12 @@ func registerFieldLabelConversions(scheme *runtime.Scheme) error {
 	); err != nil {
 		return err
 	}
+	if err := scheme.AddFieldLabelConversionFunc(
+		corev1.SchemeGroupVersion.WithKind("Secret"),
+		passthroughFieldSelectors(secretSelectableFields),
+	); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -65,6 +71,10 @@ var podSelectableFields = map[string]struct{}{
 
 var namespaceSelectableFields = map[string]struct{}{
 	"status.phase": {},
+}
+
+var secretSelectableFields = map[string]struct{}{
+	"type": {},
 }
 
 // Mirror the keys our event getAttrs publishes; this is what

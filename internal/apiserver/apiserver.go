@@ -240,11 +240,67 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 		return nil, err
 	}
 
+	configMaps, err := newStore(resourceConfig{
+		resource:    "configmaps",
+		singular:    "configmap",
+		prefix:      "/configmaps",
+		namespaced:  true,
+		shortNames:  []string{"cm"},
+		table:       configMapTableConvertor{},
+		newFunc:     func() runtime.Object { return &corev1.ConfigMap{} },
+		newListFunc: func() runtime.Object { return &corev1.ConfigMapList{} },
+		getAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+			cm, ok := obj.(*corev1.ConfigMap)
+			if !ok {
+				return nil, nil, fmt.Errorf("not a ConfigMap: %T", obj)
+			}
+			return labels.Set(cm.Labels), fields.Set{
+				"metadata.name":      cm.Name,
+				"metadata.namespace": cm.Namespace,
+			}, nil
+		},
+		create: newConfigDataStrategy(scheme, true),
+		update: newConfigDataStrategy(scheme, true),
+		del:    newConfigDataStrategy(scheme, true),
+	}, dataDir, codec, counter)
+	if err != nil {
+		return nil, err
+	}
+
+	secrets, err := newStore(resourceConfig{
+		resource:    "secrets",
+		singular:    "secret",
+		prefix:      "/secrets",
+		namespaced:  true,
+		table:       secretTableConvertor{},
+		newFunc:     func() runtime.Object { return &corev1.Secret{} },
+		newListFunc: func() runtime.Object { return &corev1.SecretList{} },
+		getAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+			s, ok := obj.(*corev1.Secret)
+			if !ok {
+				return nil, nil, fmt.Errorf("not a Secret: %T", obj)
+			}
+			return labels.Set(s.Labels), fields.Set{
+				"metadata.name":      s.Name,
+				"metadata.namespace": s.Namespace,
+				"type":               string(s.Type),
+			}, nil
+		},
+		create: newSecretStrategy(scheme),
+		update: newSecretStrategy(scheme),
+		del:    newSecretStrategy(scheme),
+	}, dataDir, codec, counter)
+	if err != nil {
+		return nil, err
+	}
+
 	return map[string]rest.Storage{
 		"pods":        withShortNames(pods, []string{"po"}),
 		"pods/status": podStatus,
 		"namespaces":  withShortNames(namespaces, []string{"ns"}),
 		"events":      withShortNames(events, []string{"ev"}),
+		"configmaps":  withShortNames(configMaps, []string{"cm"}),
+		"secrets":     secrets,
 	}, nil
 }
 

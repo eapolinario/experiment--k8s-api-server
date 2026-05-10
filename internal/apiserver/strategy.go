@@ -26,6 +26,9 @@ type objectStrategy struct {
 	// resetStatus wipes the .status field on create. Only set for kinds
 	// that have a status subresource (Pod, Namespace).
 	resetStatus func(obj runtime.Object)
+	// beforeWrite runs on every create and update PrepareFor* call,
+	// after status reset. Used by Secret to fold StringData into Data.
+	beforeWrite func(obj runtime.Object)
 }
 
 func newPodStrategy(typer runtime.ObjectTyper) *objectStrategy {
@@ -63,6 +66,9 @@ func (s *objectStrategy) PrepareForCreate(_ context.Context, obj runtime.Object)
 	if s.resetStatus != nil {
 		s.resetStatus(obj)
 	}
+	if s.beforeWrite != nil {
+		s.beforeWrite(obj)
+	}
 }
 
 func (s *objectStrategy) Validate(_ context.Context, _ runtime.Object) field.ErrorList {
@@ -77,7 +83,11 @@ func (s *objectStrategy) Canonicalize(_ runtime.Object) {}
 
 func (s *objectStrategy) AllowCreateOnUpdate() bool { return false }
 
-func (s *objectStrategy) PrepareForUpdate(_ context.Context, _, _ runtime.Object) {}
+func (s *objectStrategy) PrepareForUpdate(_ context.Context, obj, _ runtime.Object) {
+	if s.beforeWrite != nil {
+		s.beforeWrite(obj)
+	}
+}
 
 func (s *objectStrategy) ValidateUpdate(_ context.Context, _, _ runtime.Object) field.ErrorList {
 	return nil
@@ -143,6 +153,39 @@ func (podGracefulStrategy) CheckGracefulDelete(_ context.Context, obj runtime.Ob
 	// gracePeriodSeconds==0 means "force / immediate". Tell the Store no
 	// graceful path so it removes the object now.
 	return *options.GracePeriodSeconds > 0
+}
+
+// newConfigDataStrategy returns a strategy for ConfigMap and Secret. They
+// have no status subresource and no graceful delete; the only nuance is
+// that namespaceScoped is always true.
+func newConfigDataStrategy(typer runtime.ObjectTyper, namespaced bool) *objectStrategy {
+	return &objectStrategy{
+		ObjectTyper:     typer,
+		NameGenerator:   names.SimpleNameGenerator,
+		namespaceScoped: namespaced,
+	}
+}
+
+// newSecretStrategy returns a strategy that translates Secret.StringData
+// into base64-decoded Secret.Data on create + update, mirroring real
+// apiserver behaviour. StringData entries always overwrite same-key
+// entries in Data.
+func newSecretStrategy(typer runtime.ObjectTyper) *objectStrategy {
+	s := newConfigDataStrategy(typer, true)
+	s.beforeWrite = func(obj runtime.Object) {
+		sec, ok := obj.(*corev1.Secret)
+		if !ok || len(sec.StringData) == 0 {
+			return
+		}
+		if sec.Data == nil {
+			sec.Data = map[string][]byte{}
+		}
+		for k, v := range sec.StringData {
+			sec.Data[k] = []byte(v)
+		}
+		sec.StringData = nil
+	}
+	return s
 }
 
 const defaultGracePeriodSeconds int64 = 30

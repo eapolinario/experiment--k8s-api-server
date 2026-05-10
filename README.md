@@ -122,12 +122,15 @@ Builds a generic apiserver with `genericserver.RecommendedConfig`:
 - Authz = `AlwaysAllowAuthorizer`
 - Registered REST: `Pod`, `Pod/status` subresource, `Pod/log` subresource
   (a `rest.Connecter` that proxies streaming GETs to kubelet-lite),
-  `Namespace`, `Event` — all under `/api/v1`, all backed by `fsstorage`.
-  Custom `rest.TableConvertor` impls render the columns kubectl users
-  expect (`READY`/`STATUS`/`RESTARTS`/`AGE` for pods; `STATUS`/`AGE` for
-  ns; `LAST SEEN`/`TYPE`/`REASON`/`OBJECT`/`MESSAGE` for events).
-  Short names: `po`, `ns`, `ev`. Per-resource field-selector allowlists
-  (e.g. `involvedObject.name` for Events) are wired via
+  `Namespace`, `Event`, `ConfigMap`, `Secret` — all under `/api/v1`, all
+  backed by `fsstorage`. Custom `rest.TableConvertor` impls render the
+  columns kubectl users expect (`READY`/`STATUS`/`RESTARTS`/`AGE` for
+  pods; `STATUS`/`AGE` for ns; `LAST SEEN`/`TYPE`/`REASON`/`OBJECT`/
+  `MESSAGE` for events; `NAME`/`DATA`/`AGE` for cm; `NAME`/`TYPE`/`DATA`/
+  `AGE` for secrets). Short names: `po`, `ns`, `ev`, `cm`. The Secret
+  strategy folds `stringData` into `data` on create + update, matching
+  upstream behaviour. Per-resource field-selector allowlists (e.g.
+  `involvedObject.name` for Events, `type` for Secrets) are wired via
   `scheme.AddFieldLabelConversionFunc` so `kubectl describe pod` works.
 - OpenAPI v2 disabled (vendoring `pkg/generated/openapi` would more than
   double the binary), v3 stubbed in `openapi.go` with empty schemas. This
@@ -153,6 +156,12 @@ A SharedIndexInformer-driven reconciler with one worker:
   occurrence — we don't aggregate into series) for the upstream-kubelet
   reasons `Pulling`/`Pulled`/`Failed`/`Created`/`Started`/`Killing`,
   visible to `kubectl get events` and `kubectl describe pod`.
+- Resolves Pod `env` / `envFrom` and `configMap` / `secret` volume
+  sources by fetching the referenced objects from the apiserver. Volume
+  contents are materialised under `--volume-root` (one dir per
+  `(podUID, volumeName)`) and bind-mounted read-only into the container.
+  Stale projection dirs are removed when the pod is reaped. Other volume
+  types (emptyDir, hostPath, projected, ...) are skipped with a warning.
 
 ### Examples
 
