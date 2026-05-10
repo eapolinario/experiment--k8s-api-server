@@ -145,6 +145,8 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 		singular:    "pod",
 		prefix:      "/pods",
 		namespaced:  true,
+		shortNames:  []string{"po"},
+		table:       podTableConvertor{},
 		newFunc:     func() runtime.Object { return &corev1.Pod{} },
 		newListFunc: func() runtime.Object { return &corev1.PodList{} },
 		getAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
@@ -174,6 +176,8 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 		singular:    "namespace",
 		prefix:      "/namespaces",
 		namespaced:  false,
+		shortNames:  []string{"ns"},
+		table:       namespaceTableConvertor{},
 		newFunc:     func() runtime.Object { return &corev1.Namespace{} },
 		newListFunc: func() runtime.Object { return &corev1.NamespaceList{} },
 		getAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
@@ -195,9 +199,9 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 	}
 
 	return map[string]rest.Storage{
-		"pods":        pods,
+		"pods":        withShortNames(pods, []string{"po"}),
 		"pods/status": podStatus,
-		"namespaces":  namespaces,
+		"namespaces":  withShortNames(namespaces, []string{"ns"}),
 	}, nil
 }
 

@@ -114,6 +114,19 @@ run_step "create namespace demo" "${KCTL[@]}" create namespace demo
 run_step "apply nginx pod"       "${KCTL[@]}" apply --validate=false -f examples/nginx.yaml
 run_step "get pods -A"           "${KCTL[@]}" get pods -A
 
+# Custom TableConvertor: kubectl get pods must render READY/STATUS columns,
+# and the `po` short name must resolve.
+if ! "${KCTL[@]}" get po -A 2>/dev/null | head -1 | grep -q 'READY'; then
+  echo "smoke: FAILED: kubectl get po -A header missing READY column"
+  fail=1
+else
+  echo "smoke: kubectl get po short name + columns OK"
+fi
+if ! "${KCTL[@]}" get ns 2>/dev/null | head -1 | grep -q 'STATUS'; then
+  echo "smoke: FAILED: kubectl get ns header missing STATUS column"
+  fail=1
+fi
+
 NGINX_FILE="$DATA_DIR/pods/default/nginx.json"
 if [[ -f "$NGINX_FILE" ]]; then
   echo "smoke: on-disk pod found at $NGINX_FILE"

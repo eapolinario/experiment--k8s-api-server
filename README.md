@@ -122,7 +122,10 @@ Builds a generic apiserver with `genericserver.RecommendedConfig`:
 - Authz = `AlwaysAllowAuthorizer`
 - Registered REST: `Pod`, `Pod/status` subresource, `Pod/log` subresource
   (a `rest.Connecter` that proxies streaming GETs to kubelet-lite),
-  `Namespace` — all under `/api/v1`, all backed by `fsstorage`
+  `Namespace` — all under `/api/v1`, all backed by `fsstorage`. Custom
+  `rest.TableConvertor` impls render the columns kubectl users expect
+  (`READY`/`STATUS`/`RESTARTS`/`AGE` for pods; `STATUS`/`AGE` for ns).
+  Short names: `po`, `ns`.
 - OpenAPI v2 disabled (vendoring `pkg/generated/openapi` would more than
   double the binary), v3 stubbed in `openapi.go` with empty schemas. This
   is why `kubectl apply` requires `--validate=false`.
@@ -202,8 +205,6 @@ between "real Kubernetes" and "the smallest thing that still says
   (`/containerLogs/{ns}/{name}`) which in turn shells out to
   `docker logs`. Streaming + `--follow` + `--tail` + `--timestamps`
   + `--since` are all forwarded.
-- **`kubectl get ns` (short name) doesn't work** — the apiserver doesn't
-  set TableConvertor short names. Use `kubectl get namespaces`.
 - **HA is not a goal.** A single apiserver process owns its `data/`
   directory exclusively.
 
