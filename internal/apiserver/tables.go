@@ -115,8 +115,13 @@ func (namespaceTableConvertor) ConvertToTable(_ context.Context, object runtime.
 }
 
 // podDisplayStatus mirrors the column kubectl prints in the STATUS slot:
-// terminated containers report Reason; otherwise the Pod phase.
+// terminated containers report Reason; otherwise the Pod phase. A pod with
+// metadata.deletionTimestamp set renders as "Terminating" regardless of
+// phase, matching kubectl behaviour.
 func podDisplayStatus(p *corev1.Pod) string {
+	if p.DeletionTimestamp != nil {
+		return "Terminating"
+	}
 	for _, cs := range p.Status.ContainerStatuses {
 		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
 			return cs.State.Waiting.Reason

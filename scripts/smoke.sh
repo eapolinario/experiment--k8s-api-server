@@ -183,10 +183,18 @@ else
 fi
 
 # Now delete the pod and assert teardown within 30s.
-echo "smoke: deleting pod nginx"
-if ! "${KCTL[@]}" delete pod nginx --grace-period=0 --force 2>&1; then
-  # --force may not be honored, plain delete is fine too.
-  "${KCTL[@]}" delete pod nginx || true
+echo "smoke: deleting pod nginx (graceful, default 30s grace; expect Terminating phase first)"
+"${KCTL[@]}" delete pod nginx --wait=false 2>&1 | head -1 || true
+
+# Allow the apiserver a moment to set deletionTimestamp + emit the
+# Modified watch event before we observe.
+sleep 1
+phase_status="$("${KCTL[@]}" get pod nginx --no-headers 2>/dev/null || true)"
+if echo "$phase_status" | grep -q 'Terminating'; then
+  echo "smoke: pod observed as Terminating during graceful delete"
+else
+  # Tight race — kubelet may have force-deleted already. Don't fail; just log.
+  echo "smoke: (info) Terminating phase not observed: '$phase_status'"
 fi
 
 gone=0

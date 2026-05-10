@@ -182,9 +182,15 @@ between "real Kubernetes" and "the smallest thing that still says
   belongs to our single kubelet.
 - **Garbage collection.** No GC controller; no owner-ref cascading. We
   leave `metadata.ownerReferences` untouched but never act on them.
-- **Finalizers.** Apiserver `Delete` is immediate (no grace period
-  bookkeeping). The kubelet reacts to a watch DELETE event and tears the
-  container down — there's no "Terminating" phase visible to users.
+- **Finalizers.** We don't run finalizer arrays. We do implement the
+  two-phase graceful delete dance: a DELETE on a Pod sets
+  `metadata.deletionTimestamp` + `metadata.deletionGracePeriodSeconds`
+  (defaulted from `spec.terminationGracePeriodSeconds`, fallback 30s)
+  and returns 200 without removing the object. `kubelet-lite` observes
+  the resulting Modified event, stops the container honoring the grace
+  period, then issues a force-DELETE (`gracePeriodSeconds=0`) so the
+  apiserver removes the object and a watch DELETE fires. `kubectl get
+  pod` shows `STATUS=Terminating` while termination is in flight.
 - **Eventual consistency between resources.** Real apiserver fans an event
   out across many watch caches, indexers, and admission paths. We do one
   write to disk and one broadcast.

@@ -163,7 +163,7 @@ func buildV1Storage(scheme *runtime.Scheme, dataDir string, codec runtime.Codec)
 		},
 		create: newPodStrategy(scheme),
 		update: newPodStrategy(scheme),
-		del:    newPodStrategy(scheme),
+		del:    newPodGracefulStrategy(scheme),
 	}, dataDir, codec, counter)
 	if err != nil {
 		return nil, err
