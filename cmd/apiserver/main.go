@@ -23,16 +23,17 @@ func main() {
 		bindPort      = flag.Int("secure-port", 6443, "https port")
 		certDir       = flag.String("cert-dir", "run/pki", "directory for serving cert + CA")
 		dataDir       = flag.String("data-dir", "data", "filesystem storage root")
+		kubeletLogURL = flag.String("kubelet-log-url", "http://127.0.0.1:10350", "base URL of kubelet-lite's log HTTP server")
 		kubeconfigOut = flag.String("kubeconfig-out", "run/kubeconfig", "where to write the anonymous-auth kubeconfig")
 	)
 	flag.Parse()
 
-	if err := run(*bindAddr, *bindPort, *certDir, *dataDir, *kubeconfigOut); err != nil {
+	if err := run(*bindAddr, *bindPort, *certDir, *dataDir, *kubeconfigOut, *kubeletLogURL); err != nil {
 		log.Fatalf("apiserver: %v", err)
 	}
 }
 
-func run(bindAddr string, bindPort int, certDir, dataDir, kubeconfigOut string) error {
+func run(bindAddr string, bindPort int, certDir, dataDir, kubeconfigOut, kubeletLogURL string) error {
 	if err := os.MkdirAll(certDir, 0o755); err != nil {
 		return err
 	}
@@ -53,10 +54,11 @@ func run(bindAddr string, bindPort int, certDir, dataDir, kubeconfigOut string) 
 	}
 
 	srv, err := apiserver.Build(apiserver.Options{
-		BindAddress: bindAddr,
-		BindPort:    bindPort,
-		CertDir:     certDir,
-		DataDir:     dataDir,
+		BindAddress:   bindAddr,
+		BindPort:      bindPort,
+		CertDir:       certDir,
+		DataDir:       dataDir,
+		KubeletLogURL: kubeletLogURL,
 	})
 	if err != nil {
 		return fmt.Errorf("build: %w", err)

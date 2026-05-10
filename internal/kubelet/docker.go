@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,8 +14,20 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
+	cerrdefs "github.com/containerd/errdefs"
 	"k8s.io/klog/v2"
 )
+
+// LogOptions are the parameters supported by DockerRuntime.Logs. They
+// mirror a small subset of corev1.PodLogOptions.
+type LogOptions struct {
+	Follow       bool
+	Timestamps   bool
+	TailLines    *int64
+	SinceSeconds *int64
+	LimitBytes   *int64
+}
 
 // DockerRuntime is a thin wrapper over the Docker SDK with only the methods
 // kubelet-lite uses. It exists so the reconciler depends on a small, easy-to-
@@ -26,6 +39,7 @@ type DockerRuntime interface {
 	Stop(ctx context.Context, name string, gracePeriod time.Duration) error
 	Remove(ctx context.Context, name string) error
 	ListManagedUIDs(ctx context.Context) (map[string]string, error) // uid -> container name
+	Logs(ctx context.Context, name string, opts LogOptions) (io.ReadCloser, error)
 	Close() error
 }
 
@@ -50,7 +64,7 @@ func (r *dockerRT) imageExists(ctx context.Context, ref string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if dockerclient.IsErrNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		return false, nil
 	}
 	return false, err
@@ -145,7 +159,7 @@ func (r *dockerRT) CreateAndStart(ctx context.Context, name string, spec Contain
 func (r *dockerRT) Inspect(ctx context.Context, name string) (ContainerView, bool, error) {
 	insp, err := r.cli.ContainerInspect(ctx, name)
 	if err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return ContainerView{}, false, nil
 		}
 		return ContainerView{}, false, err
@@ -173,7 +187,7 @@ func (r *dockerRT) Stop(ctx context.Context, name string, gracePeriod time.Durat
 	secs := int(gracePeriod.Seconds())
 	opts := container.StopOptions{Timeout: &secs}
 	if err := r.cli.ContainerStop(ctx, name, opts); err != nil {
-		if dockerclient.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		return err
@@ -183,10 +197,81 @@ func (r *dockerRT) Stop(ctx context.Context, name string, gracePeriod time.Durat
 
 func (r *dockerRT) Remove(ctx context.Context, name string) error {
 	err := r.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
-	if err != nil && !dockerclient.IsErrNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 	return nil
+}
+
+// Logs streams demultiplexed stdout+stderr from a container as a single
+// line-interleaved byte stream — same shape `kubectl logs` expects from a
+// real kubelet's /containerLogs/ endpoint.
+func (r *dockerRT) Logs(ctx context.Context, name string, opts LogOptions) (io.ReadCloser, error) {
+	dopts := container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     opts.Follow,
+		Timestamps: opts.Timestamps,
+	}
+	if opts.TailLines != nil {
+		dopts.Tail = strconv.FormatInt(*opts.TailLines, 10)
+	}
+	if opts.SinceSeconds != nil && *opts.SinceSeconds > 0 {
+		dopts.Since = time.Now().Add(-time.Duration(*opts.SinceSeconds) * time.Second).Format(time.RFC3339Nano)
+	}
+	rc, err := r.cli.ContainerLogs(ctx, name, dopts)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil, errContainerNotFound
+		}
+		return nil, fmt.Errorf("ContainerLogs(%s): %w", name, err)
+	}
+	// Docker multiplexes stdout/stderr when the container has no TTY. Demux
+	// in a goroutine so the consumer sees a clean byte stream.
+	pr, pw := io.Pipe()
+	go func() {
+		var w io.Writer = pw
+		if opts.LimitBytes != nil && *opts.LimitBytes > 0 {
+			w = &limitWriter{w: pw, n: *opts.LimitBytes}
+		}
+		_, err := stdcopy.StdCopy(w, w, rc)
+		_ = rc.Close()
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, errLimitReached) {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+	return pr, nil
+}
+
+// errContainerNotFound is returned by Logs when no container exists for the
+// requested name. Callers map this to HTTP 404.
+var errContainerNotFound = errors.New("container not found")
+var errLimitReached = errors.New("log byte limit reached")
+
+// IsContainerNotFound reports whether err indicates the named container
+// does not exist.
+func IsContainerNotFound(err error) bool { return errors.Is(err, errContainerNotFound) }
+
+type limitWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if l.n <= 0 {
+		return 0, errLimitReached
+	}
+	if int64(len(p)) > l.n {
+		p = p[:l.n]
+	}
+	n, err := l.w.Write(p)
+	l.n -= int64(n)
+	if err == nil && l.n <= 0 {
+		err = errLimitReached
+	}
+	return n, err
 }
 
 func (r *dockerRT) ListManagedUIDs(ctx context.Context) (map[string]string, error) {

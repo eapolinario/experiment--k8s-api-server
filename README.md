@@ -120,8 +120,9 @@ Builds a generic apiserver with `genericserver.RecommendedConfig`:
 - Serving HTTPS via `SecureServingOptions.WithLoopback`
 - Authn = `AnonymousAuthenticator`
 - Authz = `AlwaysAllowAuthorizer`
-- Registered REST: `Pod`, `Pod/status` subresource, `Namespace` — all under
-  `/api/v1`, all backed by `fsstorage`
+- Registered REST: `Pod`, `Pod/status` subresource, `Pod/log` subresource
+  (a `rest.Connecter` that proxies streaming GETs to kubelet-lite),
+  `Namespace` — all under `/api/v1`, all backed by `fsstorage`
 - OpenAPI v2 disabled (vendoring `pkg/generated/openapi` would more than
   double the binary), v3 stubbed in `openapi.go` with empty schemas. This
   is why `kubectl apply` requires `--validate=false`.
@@ -139,6 +140,9 @@ A SharedIndexInformer-driven reconciler with one worker:
 - Status is PATCHed back through the apiserver via the `/status`
   subresource so it survives the `objectStrategy` strip.
 - An orphan reaper sweeps containers whose Pod no longer exists.
+- A small HTTP server on `127.0.0.1:10350` exposes
+  `GET /containerLogs/{ns}/{name}` so the apiserver's `pods/log`
+  subresource can stream `docker logs` output back to `kubectl logs`.
 
 ### Examples
 
@@ -193,11 +197,13 @@ between "real Kubernetes" and "the smallest thing that still says
   `status.podIP` is hardcoded to a placeholder.
 - **No Service / Endpoints / DNS / kube-proxy / CNI.**
 - **No CRDs, aggregation layer, or webhook admission.**
+- **`kubectl logs` works** — the apiserver registers a `pods/log`
+  subresource that proxies to a tiny HTTP server in `kubelet-lite`
+  (`/containerLogs/{ns}/{name}`) which in turn shells out to
+  `docker logs`. Streaming + `--follow` + `--tail` + `--timestamps`
+  + `--since` are all forwarded.
 - **`kubectl get ns` (short name) doesn't work** — the apiserver doesn't
   set TableConvertor short names. Use `kubectl get namespaces`.
-- **`kubectl logs` doesn't work** — we don't implement `Pod/log`. To see
-  output of your container, use `docker logs $(docker ps -q
-  --filter label=io.k8s.pod.name=nginx)`.
 - **HA is not a goal.** A single apiserver process owns its `data/`
   directory exclusively.
 

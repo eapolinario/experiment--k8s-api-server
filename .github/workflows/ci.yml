@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.9"
+
+jobs:
+  build-test:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test (race)
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.4
+
+  smoke:
+    name: e2e smoke (docker)
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+      - name: docker info
+        run: docker info
+      - name: build binaries
+        run: |
+          mkdir -p bin
+          go build -o bin/apiserver    ./cmd/apiserver
+          go build -o bin/kubelet-lite ./cmd/kubelet-lite
+      - name: run smoke
+        run: bash scripts/smoke.sh
+      - name: upload run logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            run/*.log
+            run/kubectl-logs.err
+          if-no-files-found: ignore

@@ -46,18 +46,19 @@ func main() {
 		kubeconfig = flag.String("kubeconfig", "./run/kubeconfig", "path to kubeconfig")
 		resync     = flag.Duration("resync", 30*time.Second, "informer resync period")
 		nodeName   = flag.String("node-name", "kubelet-lite", "advisory node name (informational; we own every Pod)")
+		logAddr    = flag.String("log-addr", "127.0.0.1:10350", "host:port for the /containerLogs HTTP server")
 	)
 	klog.InitFlags(nil)
 	flag.Parse()
 
-	if err := run(*kubeconfig, *resync, *nodeName); err != nil {
+	if err := run(*kubeconfig, *resync, *nodeName, *logAddr); err != nil {
 		klog.Errorf("kubelet-lite: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(kubeconfig string, resync time.Duration, nodeName string) error {
-	klog.Infof("kubelet-lite starting (node-name=%s, resync=%s, kubeconfig=%s)", nodeName, resync, kubeconfig)
+func run(kubeconfig string, resync time.Duration, nodeName, logAddr string) error {
+	klog.Infof("kubelet-lite starting (node-name=%s, resync=%s, kubeconfig=%s, log-addr=%s)", nodeName, resync, kubeconfig, logAddr)
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -81,5 +82,23 @@ func run(kubeconfig string, resync time.Duration, nodeName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	return r.Run(ctx)
+	// Run the log HTTP server alongside the reconciler. Failure of either
+	// is fatal so the supervisor (`make up`) restarts the whole process.
+	logSrv := kubelet.NewLogServer(r)
+	logErr := make(chan error, 1)
+	go func() { logErr <- logSrv.Run(ctx, logAddr) }()
+
+	recErr := make(chan error, 1)
+	go func() { recErr <- r.Run(ctx) }()
+
+	select {
+	case err := <-logErr:
+		cancel()
+		<-recErr
+		return err
+	case err := <-recErr:
+		cancel()
+		<-logErr
+		return err
+	}
 }

@@ -50,6 +50,7 @@ func TestBuildRegistersExpectedREST(t *testing.T) {
 		"/api/v1/namespaces/{namespace}/pods",
 		"/api/v1/namespaces/{namespace}/pods/{name}",
 		"/api/v1/namespaces/{namespace}/pods/{name}/status",
+		"/api/v1/namespaces/{namespace}/pods/{name}/log",
 	}
 	listed := srv.Handler.GoRestfulContainer.RegisteredWebServices()
 	all := []string{}
