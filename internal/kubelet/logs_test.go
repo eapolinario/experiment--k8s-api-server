@@ -29,7 +29,7 @@ func (f *fakeDocker) Inspect(context.Context, string) (ContainerView, bool, erro
 }
 func (f *fakeDocker) Stop(context.Context, string, time.Duration) error { return nil }
 func (f *fakeDocker) Remove(context.Context, string) error              { return nil }
-func (f *fakeDocker) ListManagedUIDs(context.Context) (map[string]string, error) {
+func (f *fakeDocker) ListManagedContainers(context.Context) ([]ManagedContainer, error) {
 	return nil, nil
 }
 func (f *fakeDocker) Close() error { return nil }
@@ -41,19 +41,28 @@ func (f *fakeDocker) Logs(ctx context.Context, name string, opts LogOptions) (io
 }
 
 type fakeResolver struct {
-	uids map[string]string // "ns/name" -> uid
-	err  error
+	// uids: "ns/name" -> uid
+	uids map[string]string
+	// containers: "ns/name" -> ordered container names; missing entries
+	// default to a single "main" container so older single-container
+	// tests don't need updating.
+	containers map[string][]string
+	err        error
 }
 
-func (r fakeResolver) UIDFor(ns, name string) (string, error) {
+func (r fakeResolver) Resolve(ns, name string) (string, []string, error) {
 	if r.err != nil {
-		return "", r.err
+		return "", nil, r.err
 	}
 	uid, ok := r.uids[ns+"/"+name]
 	if !ok {
-		return "", &notFoundErr{}
+		return "", nil, &notFoundErr{}
 	}
-	return uid, nil
+	cs := r.containers[ns+"/"+name]
+	if len(cs) == 0 {
+		cs = []string{"main"}
+	}
+	return uid, cs, nil
 }
 
 type notFoundErr struct{}
@@ -87,8 +96,8 @@ func TestLogServer_StreamsLogsForKnownPod(t *testing.T) {
 	if string(got) != body {
 		t.Errorf("body=%q want %q", got, body)
 	}
-	if fd.gotName != "klite_uid-1" {
-		t.Errorf("container name=%q want klite_uid-1", fd.gotName)
+	if fd.gotName != ContainerName("uid-1", "main") {
+		t.Errorf("container name=%q want %q", fd.gotName, ContainerName("uid-1", "main"))
 	}
 	if fd.gotOpts.TailLines == nil || *fd.gotOpts.TailLines != 10 {
 		t.Errorf("tailLines=%v want 10", fd.gotOpts.TailLines)
@@ -198,5 +207,98 @@ func TestLimitWriter(t *testing.T) {
 	}
 	if buf.String() != "hello" {
 		t.Errorf("buf=%q", buf.String())
+	}
+}
+
+func TestLogServer_MultiContainerRequiresContainerParam(t *testing.T) {
+	fd := &fakeDocker{logs: func(context.Context, string, LogOptions) (io.ReadCloser, error) {
+		t.Fatal("docker.Logs must not be called when container ambiguous")
+		return nil, nil
+	}}
+	srv := newLogServerForTest(fd, fakeResolver{
+		uids:       map[string]string{"default/web": "uid-w"},
+		containers: map[string][]string{"default/web": {"main", "side"}},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/containerLogs/default/web")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 (multi-container needs ?container=)", resp.StatusCode)
+	}
+}
+
+func TestLogServer_PicksContainerByName(t *testing.T) {
+	fd := &fakeDocker{logs: func(_ context.Context, _ string, _ LogOptions) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("hi from sidecar\n")), nil
+	}}
+	srv := newLogServerForTest(fd, fakeResolver{
+		uids:       map[string]string{"default/web": "uid-w"},
+		containers: map[string][]string{"default/web": {"main", "side"}},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/containerLogs/default/web?container=side")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+	}
+	if fd.gotName != ContainerName("uid-w", "side") {
+		t.Errorf("docker name=%q want %q", fd.gotName, ContainerName("uid-w", "side"))
+	}
+}
+
+func TestLogServer_RejectsUnknownContainerName(t *testing.T) {
+	fd := &fakeDocker{logs: func(context.Context, string, LogOptions) (io.ReadCloser, error) {
+		t.Fatal("docker.Logs must not be called when container name unknown")
+		return nil, nil
+	}}
+	srv := newLogServerForTest(fd, fakeResolver{
+		uids:       map[string]string{"default/web": "uid-w"},
+		containers: map[string][]string{"default/web": {"main", "side"}},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/containerLogs/default/web?container=ghost")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400", resp.StatusCode)
+	}
+}
+
+func TestPickContainer(t *testing.T) {
+	cases := []struct {
+		name       string
+		requested  string
+		available  []string
+		want       string
+		wantError  bool
+	}{
+		{"single implicit", "", []string{"only"}, "only", false},
+		{"single explicit", "only", []string{"only"}, "only", false},
+		{"multi implicit fails", "", []string{"a", "b"}, "", true},
+		{"multi explicit ok", "b", []string{"a", "b"}, "b", false},
+		{"unknown name fails", "ghost", []string{"a", "b"}, "", true},
+		{"empty available fails", "", nil, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := pickContainer(c.requested, c.available)
+			if (err != nil) != c.wantError {
+				t.Fatalf("err=%v wantError=%v", err, c.wantError)
+			}
+			if got != c.want {
+				t.Errorf("got=%q want=%q", got, c.want)
+			}
+		})
 	}
 }

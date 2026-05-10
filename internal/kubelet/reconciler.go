@@ -199,81 +199,115 @@ func (r *Reconciler) reconcilePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	// Graceful termination: apiserver has set deletionTimestamp but the
-	// object still exists in storage. Stop the container honoring the
+	// object still exists in storage. Stop every container honoring the
 	// grace period, then issue the final force-delete so the apiserver
 	// removes the object and a watch DELETE fires.
 	if pod.DeletionTimestamp != nil {
 		return r.terminatePod(ctx, pod)
 	}
 
-	// One-container restriction.
-	if len(pod.Spec.Containers) != 1 {
-		msg := fmt.Sprintf("kubelet-lite v1 supports exactly one container per Pod (got %d)", len(pod.Spec.Containers))
-		return r.markFailedOnce(ctx, pod, msg)
-	}
-
-	spec, err := ContainerSpecFromPod(ctx, r.kube, pod, r.volumeRoot)
+	specs, err := ContainerSpecsFromPod(ctx, r.kube, pod, r.volumeRoot)
 	if err != nil {
 		return r.markFailedOnce(ctx, pod, err.Error())
 	}
 
-	name := ContainerNameForUID(uid)
-	view, exists, err := r.docker.Inspect(ctx, name)
-	if err != nil {
-		return fmt.Errorf("inspect: %w", err)
+	// Iterate in spec order so the first container (the netns sandbox)
+	// is created before any sibling tries to attach to its netns.
+	views := make(map[string]ContainerView, len(specs))
+	for _, spec := range specs {
+		containerDockerName := ContainerName(uid, spec.ContainerNm)
+		view, exists, err := r.docker.Inspect(ctx, containerDockerName)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", containerDockerName, err)
+		}
+		if !exists {
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulling, "Pulling image %q", spec.Image)
+			if err := r.docker.EnsurePulled(ctx, spec.Image, string(spec.PullPolicy)); err != nil {
+				r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to pull image %q for container %q: %v", spec.Image, spec.ContainerNm, err)
+				return r.markFailedOnce(ctx, pod, fmt.Sprintf("image pull failed for %q: %v", spec.ContainerNm, err))
+			}
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulled, "Successfully pulled image %q", spec.Image)
+			id, err := r.docker.CreateAndStart(ctx, containerDockerName, spec)
+			if err != nil {
+				r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to create container %q: %v", spec.ContainerNm, err)
+				return r.markFailedOnce(ctx, pod, fmt.Sprintf("create/start %q failed: %v", spec.ContainerNm, err))
+			}
+			klog.Infof("started container %s id=%s for pod %s/%s", containerDockerName, id, pod.Namespace, pod.Name)
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonCreated, "Created container: %s", spec.ContainerNm)
+			r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonStarted, "Started container %s", spec.ContainerNm)
+			view, _, err = r.docker.Inspect(ctx, containerDockerName)
+			if err != nil {
+				return fmt.Errorf("inspect %s after start: %w", containerDockerName, err)
+			}
+		}
+		views[spec.ContainerNm] = view
 	}
 
-	if !exists {
-		// Pull then create.
-		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulling, "Pulling image %q", spec.Image)
-		if err := r.docker.EnsurePulled(ctx, spec.Image, string(spec.PullPolicy)); err != nil {
-			r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to pull image %q: %v", spec.Image, err)
-			return r.markFailedOnce(ctx, pod, fmt.Sprintf("image pull failed: %v", err))
-		}
-		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonPulled, "Successfully pulled image %q", spec.Image)
-		id, err := r.docker.CreateAndStart(ctx, name, spec)
-		if err != nil {
-			r.recorder.Eventf(ctx, pod, corev1.EventTypeWarning, EventReasonFailed, "Failed to create container: %v", err)
-			return r.markFailedOnce(ctx, pod, fmt.Sprintf("create/start failed: %v", err))
-		}
-		klog.Infof("started container %s id=%s for pod %s/%s", name, id, pod.Namespace, pod.Name)
-		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonCreated, "Created container: %s", spec.ContainerNm)
-		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonStarted, "Started container %s", spec.ContainerNm)
-		view, _, err = r.docker.Inspect(ctx, name)
-		if err != nil {
-			return fmt.Errorf("inspect after start: %w", err)
-		}
-	}
-
-	return r.patchStatus(ctx, pod, PodStatusFromView(pod, view))
+	return r.patchStatus(ctx, pod, PodStatusFromViews(pod, views))
 }
 
-// terminatePod stops the pod's container honoring deletionGracePeriodSeconds
-// and then issues a force-delete via the apiserver to finalize. Idempotent:
-// safe to call repeatedly while termination is in flight.
+// terminatePod stops every container for the pod (in reverse spec order so
+// siblings stop before the netns sandbox) honoring deletionGracePeriodSeconds,
+// then issues a force-delete via the apiserver to finalize. Idempotent.
 func (r *Reconciler) terminatePod(ctx context.Context, pod *corev1.Pod) error {
-	name := ContainerNameForUID(string(pod.UID))
+	uid := string(pod.UID)
 	grace := 30 * time.Second
 	if pod.DeletionGracePeriodSeconds != nil {
 		grace = time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
 	}
-	klog.Infof("pod %s/%s terminating (grace=%s); stopping container %s", pod.Namespace, pod.Name, grace, name)
-	if _, exists, err := r.docker.Inspect(ctx, name); err != nil {
-		return fmt.Errorf("inspect during terminate: %w", err)
-	} else if exists {
+
+	names := r.containerNamesForPod(ctx, pod)
+	klog.Infof("pod %s/%s terminating (grace=%s); stopping %d container(s)", pod.Namespace, pod.Name, grace, len(names))
+	// Reverse order: sandbox last so siblings can still see its netns
+	// while they shut down.
+	for i := len(names) - 1; i >= 0; i-- {
+		name := names[i]
+		if _, exists, err := r.docker.Inspect(ctx, name); err != nil {
+			return fmt.Errorf("inspect %s during terminate: %w", name, err)
+		} else if !exists {
+			continue
+		}
 		r.recorder.Eventf(ctx, pod, corev1.EventTypeNormal, EventReasonKilling, "Stopping container %s (grace=%s)", name, grace)
 		if err := r.docker.Stop(ctx, name, grace); err != nil {
 			klog.Warningf("stop %s during terminate: %v", name, err)
 		}
 	}
-	// Final force-delete: GracePeriodSeconds=0 takes the immediate-delete
-	// path in the apiserver's BeforeDelete and removes the object.
+	_ = uid // referenced via names; keep var for future
 	zero := int64(0)
 	err := r.kube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	return err
+}
+
+// containerNamesForPod returns the docker container names belonging to a
+// Pod, in pod.Spec.Containers order. If the spec is unavailable (e.g. the
+// pod was already deleted from the lister), falls back to a label scan.
+func (r *Reconciler) containerNamesForPod(ctx context.Context, pod *corev1.Pod) []string {
+	if len(pod.Spec.Containers) > 0 {
+		names := make([]string, 0, len(pod.Spec.Containers))
+		for _, c := range pod.Spec.Containers {
+			names = append(names, ContainerName(string(pod.UID), c.Name))
+		}
+		return names
+	}
+	return r.containerNamesByLabel(ctx, string(pod.UID))
+}
+
+func (r *Reconciler) containerNamesByLabel(ctx context.Context, uid string) []string {
+	mgr, err := r.docker.ListManagedContainers(ctx)
+	if err != nil {
+		klog.Warningf("list managed containers: %v", err)
+		return nil
+	}
+	var names []string
+	for _, m := range mgr {
+		if m.UID == uid {
+			names = append(names, m.DockerName)
+		}
+	}
+	return names
 }
 
 func (r *Reconciler) markFailedOnce(ctx context.Context, pod *corev1.Pod, msg string) error {
@@ -305,31 +339,23 @@ func (r *Reconciler) patchStatus(ctx context.Context, pod *corev1.Pod, status co
 	return err
 }
 
-// reapByUID stops+removes any container labeled with this UID. Idempotent.
+// reapByUID stops+removes every container labeled with this UID. Idempotent.
 func (r *Reconciler) reapByUID(ctx context.Context, uid string) error {
-	name := ContainerNameForUID(uid)
-	if _, exists, err := r.docker.Inspect(ctx, name); err != nil {
-		return err
-	} else if !exists {
-		// Fall back to label scan in case the Pod predates the canonical
-		// naming (e.g. older container we want to clean up anyway).
-		uids, lerr := r.docker.ListManagedUIDs(ctx)
-		if lerr != nil {
-			return lerr
+	names := r.containerNamesByLabel(ctx, uid)
+	if len(names) == 0 {
+		return nil
+	}
+	// Reverse order: stop siblings first, sandbox last.
+	for i := len(names) - 1; i >= 0; i-- {
+		name := names[i]
+		if err := r.docker.Stop(ctx, name, 10*time.Second); err != nil {
+			klog.Warningf("stop %s: %v", name, err)
 		}
-		if cname, ok := uids[uid]; ok {
-			name = cname
-		} else {
-			return nil
+		if err := r.docker.Remove(ctx, name); err != nil {
+			return fmt.Errorf("remove %s: %w", name, err)
 		}
+		klog.Infof("reaped container %s (uid=%s)", name, uid)
 	}
-	if err := r.docker.Stop(ctx, name, 10*time.Second); err != nil {
-		klog.Warningf("stop %s: %v", name, err)
-	}
-	if err := r.docker.Remove(ctx, name); err != nil {
-		return fmt.Errorf("remove %s: %w", name, err)
-	}
-	klog.Infof("reaped container %s (uid=%s)", name, uid)
 	if r.volumeRoot != "" {
 		if err := os.RemoveAll(PodVolumeRoot(r.volumeRoot, uid)); err != nil {
 			klog.Warningf("remove volume dir for uid %s: %v", uid, err)
@@ -341,7 +367,7 @@ func (r *Reconciler) reapByUID(ctx context.Context, uid string) error {
 // reapOrphans removes any container with our io.k8s.pod.uid label whose UID
 // no longer corresponds to a known Pod.
 func (r *Reconciler) reapOrphans(ctx context.Context) error {
-	managed, err := r.docker.ListManagedUIDs(ctx)
+	managed, err := r.docker.ListManagedContainers(ctx)
 	if err != nil {
 		return err
 	}
@@ -356,16 +382,28 @@ func (r *Reconciler) reapOrphans(ctx context.Context) error {
 	for _, p := range pods {
 		known[string(p.UID)] = struct{}{}
 	}
-	for uid, name := range managed {
-		if _, ok := known[uid]; ok {
+	// Group orphan containers by UID so we reap a pod's siblings together.
+	orphansByUID := map[string][]string{}
+	for _, m := range managed {
+		if _, ok := known[m.UID]; ok {
 			continue
 		}
-		klog.Infof("orphan reaper: removing container %s (uid=%s, no matching pod)", name, uid)
-		if err := r.docker.Stop(ctx, name, 10*time.Second); err != nil {
-			klog.Warningf("orphan stop %s: %v", name, err)
+		orphansByUID[m.UID] = append(orphansByUID[m.UID], m.DockerName)
+	}
+	for uid, names := range orphansByUID {
+		klog.Infof("orphan reaper: removing %d container(s) for uid=%s", len(names), uid)
+		for _, name := range names {
+			if err := r.docker.Stop(ctx, name, 10*time.Second); err != nil {
+				klog.Warningf("orphan stop %s: %v", name, err)
+			}
+			if err := r.docker.Remove(ctx, name); err != nil {
+				klog.Warningf("orphan remove %s: %v", name, err)
+			}
 		}
-		if err := r.docker.Remove(ctx, name); err != nil {
-			klog.Warningf("orphan remove %s: %v", name, err)
+		if r.volumeRoot != "" {
+			if err := os.RemoveAll(PodVolumeRoot(r.volumeRoot, uid)); err != nil {
+				klog.Warningf("orphan remove volume dir uid=%s: %v", uid, err)
+			}
 		}
 	}
 	return nil

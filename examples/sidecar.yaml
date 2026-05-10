@@ -1,0 +1,25 @@
+# Smoke fixture: multi-container Pod. The `web` container runs nginx;
+# the `prober` sidecar shares its netns (Docker --network=container:<sandbox>)
+# and curls localhost every second to prove they really do see the same
+# loopback. `kubectl logs sidecar-pod -c prober` should print HTTP/1.1 200s.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sidecar-pod
+  namespace: default
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: web
+      image: nginx:1.27-alpine
+    - name: prober
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          # Wait briefly for the web container to bind :80 in the shared netns.
+          sleep 2
+          for i in $(seq 1 20); do
+            wget -q -S -O /dev/null http://127.0.0.1/ 2>&1 | head -1
+            sleep 1
+          done

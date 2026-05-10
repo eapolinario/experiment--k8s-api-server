@@ -289,6 +289,69 @@ fi
 "${KCTL[@]}" delete configmap demo-cfg -n default >/dev/null 2>&1 || true
 "${KCTL[@]}" delete secret demo-secret -n default >/dev/null 2>&1 || true
 
+# ----- Multi-container Pod (shared netns) -----
+echo "smoke: applying multi-container sidecar pod"
+"${KCTL[@]}" apply --validate=false -f examples/sidecar.yaml >/dev/null
+
+echo "smoke: waiting for sidecar-pod to reach Running (both containers)"
+side_uid=""
+for i in {1..60}; do
+  phase="$("${KCTL[@]}" get pod sidecar-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  ready_count="$("${KCTL[@]}" get pod sidecar-pod -n default -o jsonpath='{range .status.containerStatuses[*]}{.ready}{"\n"}{end}' 2>/dev/null | grep -c '^true' || true)"
+  if [[ "$phase" == "Running" && "$ready_count" == "2" ]]; then
+    side_uid="$("${KCTL[@]}" get pod sidecar-pod -n default -o jsonpath='{.metadata.uid}')"
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$side_uid" ]]; then
+  echo "smoke: FAIL sidecar-pod never reached Running with both containers ready (phase=$phase ready_count=$ready_count)"
+  "${KCTL[@]}" describe pod sidecar-pod -n default | tail -40
+  fail=1
+else
+  echo "smoke: sidecar-pod Running with 2 ready containers (uid=$side_uid)"
+  # We expect exactly two managed docker containers labelled with this UID,
+  # named klite_<uid>_web and klite_<uid>_prober.
+  containers="$(docker ps -a --filter "label=io.k8s.pod.uid=$side_uid" --format '{{.Names}}' | sort)"
+  echo "smoke: docker containers for sidecar-pod:"
+  echo "$containers" | sed 's/^/  /'
+  count="$(echo "$containers" | grep -c .)"
+  if [[ "$count" != "2" ]]; then
+    echo "smoke: FAIL expected 2 containers for sidecar-pod, got $count"
+    fail=1
+  fi
+  for want in "klite_${side_uid}_web" "klite_${side_uid}_prober"; do
+    if ! grep -qx "$want" <<<"$containers"; then
+      echo "smoke: FAIL missing container $want"
+      fail=1
+    fi
+  done
+  # `kubectl logs` without -c on a multi-container pod prints a
+  # "Defaulted container ... out of: ..." warning and picks the first.
+  # Verify the warning is present (proves both containers were known).
+  default_out="$("${KCTL[@]}" logs sidecar-pod -n default 2>&1 || true)"
+  if grep -q 'Defaulted container .web. out of: web, prober' <<<"$default_out"; then
+    echo "smoke: kubectl logs (no -c) defaulted to first container with multi-container warning"
+  else
+    echo "smoke: FAIL kubectl logs (no -c) missing multi-container default warning"
+    echo "$default_out" | head -5
+    fail=1
+  fi
+  # Allow prober a beat to issue some HTTP requests.
+  sleep 4
+  prober_logs="$("${KCTL[@]}" logs sidecar-pod -n default -c prober 2>&1 || true)"
+  echo "--- prober logs ---"
+  echo "$prober_logs"
+  echo "-------------------"
+  if ! grep -q 'HTTP/1.1 200' <<<"$prober_logs"; then
+    echo "smoke: FAIL prober never got HTTP/1.1 200 from web container (shared netns broken?)"
+    fail=1
+  else
+    echo "smoke: prober reached web on 127.0.0.1 — shared netns verified"
+  fi
+fi
+"${KCTL[@]}" delete pod sidecar-pod -n default --wait=false >/dev/null 2>&1 || true
+
 if [[ "$fail" -ne 0 ]]; then
   echo "--- apiserver log tail ---"; tail -50 "$API_LOG"
   echo "--- kubelet log tail ---";   tail -80 "$KUBELET_LOG"

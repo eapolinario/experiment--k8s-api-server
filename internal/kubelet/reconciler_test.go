@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,8 +41,13 @@ func (d *terminateDocker) Stop(_ context.Context, _ string, g time.Duration) err
 	return d.stopErr
 }
 func (d *terminateDocker) Remove(context.Context, string) error { return nil }
-func (d *terminateDocker) ListManagedUIDs(context.Context) (map[string]string, error) {
-	return nil, nil
+func (d *terminateDocker) ListManagedContainers(context.Context) ([]ManagedContainer, error) {
+	// Tests use single-container pods; report the canonical sandbox name
+	// when the docker layer claims the container exists.
+	if !d.exists {
+		return nil, nil
+	}
+	return []ManagedContainer{{UID: "u1", ContainerName: "nginx", DockerName: ContainerName("u1", "nginx")}}, nil
 }
 func (d *terminateDocker) Logs(context.Context, string, LogOptions) (io.ReadCloser, error) {
 	return nil, errors.New("not used")
@@ -180,6 +186,10 @@ func TestTerminatePod_EmitsKillingEvent(t *testing.T) {
 	}
 	if killing.InvolvedObject.Kind != "Pod" || killing.InvolvedObject.Name != "nginx" {
 		t.Errorf("InvolvedObject=%+v", killing.InvolvedObject)
+	}
+	wantName := ContainerName("u1", "nginx")
+	if !strings.Contains(killing.Message, wantName) {
+		t.Errorf("Killing message=%q want substring %q", killing.Message, wantName)
 	}
 	if killing.Source.Component != "kubelet-lite" {
 		t.Errorf("Source.Component=%q want kubelet-lite", killing.Source.Component)

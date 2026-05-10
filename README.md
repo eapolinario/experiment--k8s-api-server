@@ -140,9 +140,21 @@ Builds a generic apiserver with `genericserver.RecommendedConfig`:
 
 A SharedIndexInformer-driven reconciler with one worker:
 
-- For every Pod, ensure exactly one Docker container exists named
-  `klite_<pod-uid>` and labeled with `io.k8s.pod.{uid,namespace,name}` and
+- For every Pod, ensure one Docker container per `pod.spec.containers[i]`,
+  named `klite_<pod-uid>_<container-name>` and labeled with
+  `io.k8s.pod.{uid,namespace,name}`, `io.k8s.container.name`, and
   `io.k8s.managed-by=kubelet-lite`.
+- Multi-container Pods share a network namespace pause-style: the first
+  container in spec order is the netns "sandbox" (default bridge), and
+  every sibling is created with Docker `--network=container:<sandbox>`.
+  Stop order is reversed at termination so siblings shut down before
+  the netns goes away. Sibling startup follows spec order, so any
+  container whose entrypoint races against the sandbox is the user's
+  responsibility (mirroring real kubelet without init/sidecar lifecycle).
+- Per-container `ContainerStatus` populated on `pod.status.containerStatuses`;
+  pod phase aggregates as: any-not-yet-created → Pending, all running →
+  Running, any failed (exit≠0 or OOMKilled) → Failed, all exited 0 →
+  Succeeded; a Running main + a sidecar that exits 0 stays Running.
 - Pure-function spec→Docker config translation in
   `internal/kubelet/translate.go` (independent of the SDK, fully unit
   tested).
@@ -150,8 +162,11 @@ A SharedIndexInformer-driven reconciler with one worker:
   subresource so it survives the `objectStrategy` strip.
 - An orphan reaper sweeps containers whose Pod no longer exists.
 - A small HTTP server on `127.0.0.1:10350` exposes
-  `GET /containerLogs/{ns}/{name}` so the apiserver's `pods/log`
-  subresource can stream `docker logs` output back to `kubectl logs`.
+  `GET /containerLogs/{ns}/{name}?container=<name>` so the apiserver's
+  `pods/log` subresource can stream `docker logs` output back to
+  `kubectl logs`. The `container` query is required for multi-container
+  pods (kubectl normally fills it in by defaulting to the first
+  container with a "Defaulted container ..." warning).
 - A minimal event recorder posts `corev1.Event` objects (one per
   occurrence — we don't aggregate into series) for the upstream-kubelet
   reasons `Pulling`/`Pulled`/`Failed`/`Created`/`Started`/`Killing`,
